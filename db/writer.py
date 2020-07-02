@@ -2,7 +2,8 @@ import sqlite3
 import os
 from typing import List
 
-from dataclass import PoiData, InvalidPoiDataError
+from dataclass import PoiData
+from exceptions import InvalidPoiDataError
 from db.expressions import CREATE_POI_TABLE
 
 

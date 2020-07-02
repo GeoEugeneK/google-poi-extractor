@@ -1,8 +1,5 @@
 # For better understanding, refer to expressions.py and see CREATE TABLE ... expression
-
-
-class InvalidPoiDataError(Exception):
-    pass
+from exceptions import InvalidPoiDataError
 
 
 class PoiData(object):
