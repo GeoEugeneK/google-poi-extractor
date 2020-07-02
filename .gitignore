@@ -1,2 +1,4 @@
 *.sqlite
 *.sqlite3
+./tracker.json
+./keys.txt
