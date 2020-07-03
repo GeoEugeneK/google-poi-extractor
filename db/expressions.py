@@ -17,5 +17,11 @@ CREATE TABLE IF NOT EXISTS projects (
                                         /*  Extractor metadata  */
                                         date_obtained TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                                         needs_recurse BOOLEAN
+                                        
+                                        /*   NEW    */
+                                        business_status TEXT, 
+                                        
+                                        
+                                        
                                     );
 """

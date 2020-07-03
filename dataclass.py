@@ -1,5 +1,10 @@
 # For better understanding, refer to expressions.py and see CREATE TABLE ... expression
-from exceptions import InvalidPoiDataError
+from typing import List
+
+from exceptions import InvalidPoiDataError, ResponseParsingError
+
+
+NONE_TYPE = type(None)
 
 
 class PoiData(object):
@@ -10,6 +15,7 @@ class PoiData(object):
     lat: float
     name: str
     rating: float
+    business_status: str
     scope: str
     user_ratings_total: int
     vicinity: str
@@ -20,7 +26,11 @@ class PoiData(object):
 
     # timestamp is redundant, will be set default by the DB
 
-    def __init__(self, place_id, id, lon, lat, name, rating, scope, user_ratings_total, vicinity, types, price):
+    def __init__(self,
+                 place_id, id, lon, lat,
+                 name, rating, business_status, scope,
+                 user_ratings_total, vicinity, types, price,
+                 json: dict):
 
         self.place_id = place_id
         self.id = id
@@ -28,11 +38,13 @@ class PoiData(object):
         self.lat = lat
         self.name = name
         self.rating = rating
+        self.business_status = business_status
         self.scope = scope
         self.user_ratings_total = user_ratings_total
         self.vicinity = vicinity
         self.types = types
         self.price = price
+        self.json = json
 
         self.validate()
 
@@ -61,10 +73,32 @@ class PoiData(object):
             assert self.__item_valid(item=self.types, itemtype=str, not_null=True), \
                 f'invalid value for types "{self.types}" (type {type(self.types)})'
 
+            assert self.__item_valid(item=self.business_status, itemtype=str, not_null=True), \
+                f'invalid value for business_status "{self.business_status}" (type {type(self.business_status)})'
+
+            # numeric
+
+            assert self.__item_valid(item=self.lon, itemtype=float, not_null=True), \
+                f'invalid value for lon "{self.lon}" (type {type(self.lon)})'
+
+            assert self.__item_valid(item=self.lat, itemtype=float, not_null=True), \
+                f'invalid value for lat "{self.lat}" (type {type(self.lat)})'
+
+            assert self.__item_valid(item=self.rating, itemtype=(float, int, NONE_TYPE), not_null=True), \
+                f'invalid value for rating "{self.rating}" (type {type(self.rating)})'
+
+            assert self.__item_valid(item=self.user_ratings_total, itemtype=(int, NONE_TYPE), not_null=False), \
+                f'invalid value for user_ratings_total "{self.user_ratings_total}" (type {type(self.user_ratings_total)})'
+
+            assert self.__item_valid(item=self.price, itemtype=(int, NONE_TYPE), not_null=False), \
+                f'invalid value for price "{self.price}" (type {type(self.price)})'
+
+            # price_level can be None (NULL)
+
         except AssertionError as e:
             raise InvalidPoiDataError(str(e))  # raise error with the same message
 
-    def get_row(self):
+    def as_row(self):
 
         """ Returns all data items as table row values (tuple-like) """
         return [
@@ -74,13 +108,71 @@ class PoiData(object):
         ]
 
     @staticmethod
-    def __item_valid(item, itemtype: type, not_null: bool) -> bool:
+    def __item_valid(item, itemtype: [type, List[type]], not_null: bool) -> bool:
 
         if not_null:
             return True if item and isinstance(item, itemtype) else False
         else:
             return True if isinstance(item, itemtype) else False
 
-    @staticmethod
-    def from_response(resp):
-        pass  # TODO
+    @classmethod
+    def __parse_single_poi(cls, poi: dict):
+
+        try:
+            place_id = poi["place_id"]
+            _id = poi["id"]
+
+            geom = poi["geometry"]
+            lonlat = geom["location"]
+            lon = lonlat["lng"]
+            lat = lonlat["lat"]
+
+            name = poi["name"]
+            rating = poi.get("rating")      # can be NULL (None)
+            business_status = poi["business_status"]
+            scope = poi["scope"]
+            user_ratings_total = poi.get("user_ratings_total")      # can be NULL (None)
+            vicinity = poi["vicinity"]
+            types = poi["types"]
+            price = poi.get("price_level")      # can be NULL (None)
+
+        except KeyError as e:
+            raise ResponseParsingError(f"failed to parse data for a POI - dict item {e} could not be found")
+
+        return PoiData(
+            place_id=place_id,
+            id=_id,
+            lon=lon,
+            lat=lat,
+            name=name,
+            rating=rating,
+            business_status=business_status,
+            scope=scope,
+            user_ratings_total=user_ratings_total if user_ratings_total else 0,
+            vicinity=vicinity,
+            types=", ".join(types),
+            price=price,
+            json=poi
+        )
+
+    @classmethod
+    def from_response(cls, resp: dict):
+
+        """
+        Parses valid response JSON (dict) as a list of atomic POI data items.
+        Must be used instead of default constructor.
+        """
+
+        try:
+            results = resp["results"]
+            assert len(results) > 0, "no results found in response"
+
+        except KeyError as e:
+            raise ResponseParsingError(f'could not get item "{e}" from response JSON')
+
+        except AssertionError as e:
+            raise ResponseParsingError(str(e))
+
+        return [
+            cls.__parse_single_poi(poi=x) for x in results
+        ]
