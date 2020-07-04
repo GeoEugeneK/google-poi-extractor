@@ -1,20 +1,17 @@
 import json
+import multiprocessing as mp
 import os
 import time
-
-import multiprocessing as mp
 from queue import Empty
 from typing import List
 
 import googlemaps
 
-# from config import TRACKER_JSON, LANGUAGE
 import config
 from dataclass import PoiData
+from exceptions import *
 from geometries.geomworks import Densifier
 from tasks import TaskDefinition
-
-from exceptions import *
 
 
 class StatsClass(object):

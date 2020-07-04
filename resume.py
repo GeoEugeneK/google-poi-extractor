@@ -1,15 +1,11 @@
+import sqlite3
 from typing import List
 
-import config
-import sqlite3
-
-from db.expressions import GET_UNFINISHED_FROM_PREVIOUS_SESSION
+from db.expressions import GET_UNFINISHED_FROM_PREVIOUS_SESSION, GET_POI_IDS_FROM_PREVIOUS_SESSIONS
 from tasks import TaskDefinition
 
 
-def get_existing_tables(tablename: str, cursor: sqlite3.Cursor):
-
-    assert tablename, f'invalid table name "{tablename}"'
+def get_existing_tables(cursor: sqlite3.Cursor):
 
     cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
     tables = [rowtuple[0] for rowtuple in cursor.fetchall()]
@@ -20,7 +16,8 @@ def get_existing_tables(tablename: str, cursor: sqlite3.Cursor):
     return tables if tables else []
 
 
-def restore_unfinished(cursor: sqlite3.Cursor) -> List[TaskDefinition]:
+def restore_unfinished_tasks(cursor: sqlite3.Cursor) -> List[TaskDefinition]:
+
     cursor.execute(GET_UNFINISHED_FROM_PREVIOUS_SESSION)
     rows = cursor.fetchall()
 
@@ -44,6 +41,18 @@ def restore_unfinished(cursor: sqlite3.Cursor) -> List[TaskDefinition]:
     return tasks
 
 
-def __restore_prev_session_success(cursor: sqlite3.Cursor):
-    cursor.execute('xx')
+def restore_collected_place_ids(cursor: sqlite3.Cursor) -> List[str]:
+
+    cursor.execute(GET_POI_IDS_FROM_PREVIOUS_SESSIONS)
     rows = cursor.fetchall()
+
+    if len(rows) == 0:
+        print(f"ERROR: no places fetched from previous sessions!")
+        return []
+
+    place_ids: List[str] = [r[0] for r in rows]
+    place_ids = list(set(place_ids))
+
+    print(f"INFO: {len(place_ids)} places restored from previous sessions")
+
+    return place_ids

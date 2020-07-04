@@ -1,19 +1,29 @@
-import threading
+import multiprocessing as mp
+# import threading
+import sqlite3
+import sys
 import time
-from queue import Queue
+import timing
+
 from typing import List
 
-from db.writer import DatabaseWriter
-from geometries.geomworks import make_grid, get_aoi_polygon, Densifier
-from tasks import TaskDefinition
 import config
-from placetypes import get_search_types, get_valid_types
 import resume
 from api import get_api_keys
+from db.connect import make_db_connection
+from db.writer import DatabaseWriter
+from geometries.geomworks import make_grid, get_aoi_polygon
+from json_writer import RawResponseWriter
+from placetypes import get_search_types, get_valid_types
+from tasks import TaskDefinition
 from workers import GoogleWorker
 
 
-def make_initial_tasks():
+def prepare_database():
+    pass
+
+
+def make_initial_tasks() -> List[TaskDefinition]:
 
     """ Gets AOI polygon from specified layer, makes initial grid and creates initial tasks."""
 
@@ -61,18 +71,66 @@ def make_initial_tasks():
     return initial_tasks
 
 
+def restore_tasks_and_places(cursor: sqlite3.Cursor):
+
+    tables = resume.get_existing_tables(cursor=cursor)
+
+    if len(tables == 0):
+        raise Exception(f"cannot restore tasks as no tables were found in the database!")
+
+    elif config.JOBS_TABLE not in tables:
+        raise Exception(f"cannot restore tasks as table \"{config.JOBS_TABLE}\" is missing")
+
+    elif config.SUCCESS_TABLE not in tables:
+        raise Exception(f"cannot restore tasks as table \"{config.SUCCESS_TABLE}\" is missing")
+
+    elif config.POI_TABLE not in tables:
+        raise Exception(f"cannot restore tasks as table \"{config.POI_TABLE}\" is missing")
+
+    else:
+        unfinished_tasks = resume.restore_unfinished_tasks(cursor=cursor)
+        collected_place_ids = resume.restore_collected_place_ids()
+
+    return unfinished_tasks, collected_place_ids
+
+
 def main():
 
-    lock = threading.Lock()
-    writer = DatabaseWriter(db_file=config.DATABASE, lock=lock)
+    started_prepare = time.time()
+
+    # connection to prepare stuff, either for a clean start or restore prev session data
+    # must be closed before writer thread starts
+    conn = make_db_connection(config.DATABASE)      # creates the database if not exists
+    cursor = conn.cursor()
+
+    # queues
+    tasks_q = mp.Queue()
+    database_q = mp.Queue()
+    complete_q = mp.Queue()
+    raw_json_q = mp.Queue()
+
+    # locks
+    writelock = mp.Lock()
+    printlock = mp.Lock()
+
+    # make writers, but don't launch yet
+    db_writer = DatabaseWriter(db_file=config.DATABASE, poi_q=database_q,
+                               complete_tasks_q=complete_q, printlock=printlock)
+    raw_writer = RawResponseWriter(poi_q=raw_json_q, printlock=printlock)
+
+    # define typing
+    tasks: List[TaskDefinition]
+    collected_place_ids: List[str]
 
     if config.RESUME:
-        tasks: List[TaskDefinition] = resume.restore_unfinished(writer.cursor)    # restored tasks
+        tasks, collected_place_ids = restore_tasks_and_places(cursor=cursor)    # unfinished tasks only
+        db_writer.set_place_ids(place_ids=collected_place_ids)      # avoid writing duplicates, will check against these
+        db_writer.set_success_ids(["dummy"])
+
     else:
-        tasks: List[TaskDefinition] = make_initial_tasks()                        # initial_tasks
+        tasks = make_initial_tasks()                        # initial_tasks
 
     # fill queue
-    tasks_q = Queue()
     for t in tasks:
         tasks_q.put(t)
 
@@ -80,18 +138,49 @@ def main():
     keys = get_api_keys()
     assert keys, "no keys can be used!"
 
-    # initialize worker threads
+    # print info
+    _elapsed = time.time() - started_prepare
+    print(f"MAIN: ready in {_elapsed:.1f} s. Starting {len(keys)} data collector workers, one API key per thread...")
+
+    # start worker threads
     collectors = []
     for n, k in enumerate(keys):
-        t = GoogleWorker(api_key=k, writelock=lock, threadname=f"Google Places Collector - {n + 1}")
+        t = GoogleWorker(api_key=k, tasks_q=tasks_q, database_q=database_q,
+                         complete_tasks_q=complete_q, rawfile_q=raw_json_q, printlock=printlock, writelock=writelock)
         t.start()
         time.sleep(1)   # wait between starts
         collectors.append(t)
 
+    with printlock:
+        print(f"MAIN: workers started. Starting writers...")
 
+    # start writers
+    db_writer.start()
+    raw_writer.start()
+
+    with printlock:
+        print(f"MAIN: writer threads started")
+
+    for t in collectors:
+        t.join()
+
+    with printlock:
+        print(f"MAIN: collector threads joined")
+
+    db_writer.join()
+    raw_writer.join()
+
+    with printlock:
+        print(f"MAIN: writer threads joined. All jobs complete")
 
 
 
 if __name__ == '__main__':
 
-    PROCESSED_TASKS
+    started = time.time()
+
+    main()  # does all the job
+
+    elapsed = time.time() - started
+    print(f"MAIN: done in {timing.format_delta(sec=elapsed, include_ms=False)}")
+    sys.exit(0)

@@ -4,11 +4,13 @@ import sqlite3
 import time
 from typing import List, Set
 
+import config
 from queue import Empty
 from dataclass import PoiData
 from db.expressions import CREATE_POI_TABLE, DROP_JOBS, DROP_SUCCESS
 from exceptions import InvalidPoiDataError, FinishException
 from tasks import TaskDefinition
+
 
 print(f"INFO: using sqlite3 lib v.{sqlite3.version}")
 
@@ -42,7 +44,7 @@ class DatabaseWriter(mp.Process):
     finished: bool = None
     __printlock: mp.Lock
 
-    def __init__(self, db_file: str, results_queue: mp.Queue, printlock: mp.Lock):
+    def __init__(self, db_file: str, poi_q: mp.Queue, complete_tasks_q: mp.Queue, printlock: mp.Lock):
 
         self.conn = None
         self.db_file = db_file
@@ -53,10 +55,12 @@ class DatabaseWriter(mp.Process):
         assert os.path.exists(
             self.__parent_dir), f"invalid parent directory {self.__parent_dir} for an SQLite database."
 
-        self.make_db_connection()
-        self.cursor = self.conn.cursor()
+        # must be initialized in a separate process for integrity
+        # self.make_db_connection()
+        # self.cursor = self.conn.cursor()
 
-        self.queue = results_queue
+        self.poi_q = poi_q
+        self.complete_tasks_q = complete_tasks_q
         self.__printlock = printlock
 
         self.__poi_batch = []
@@ -113,10 +117,30 @@ class DatabaseWriter(mp.Process):
         self.cursor.execute(sql=CREATE_POI_TABLE)
         self.conn.commit()
 
+    def __insert_rows(self, table: str,  rows: List[tuple], column_names: List[str]):
+
+        question_marks = ",".join("?" * len(rows))
+        columns = ",".join(column_names)
+        sql = f"""INSERT INTO {table} ({columns}) VALUES ({question_marks});"""
+        self.cursor.execute(sql=sql)
+        self.conn.commit()
+
     def __write_poi_batch(self):
 
         if self.__poi_batch:
-            # TODO
+
+            rows = [
+                (
+                    poi, "todo"  # TODO rows
+                )
+                for poi in self.__poi_batch
+            ]
+
+            self.stats.unique_pois += len(rows)     # include number of poi inn stats
+
+            column_names = []   # TODO
+            self.__insert_rows(table=config.POI_TABLE, rows=rows, column_names=column_names)
+
             self.__poi_batch = []
         else:
             self.print(f"ERROR: POI batch is empty at the moment, cannot write any data!")
@@ -129,7 +153,11 @@ class DatabaseWriter(mp.Process):
                 (task.task_id, task.lon, task.lat, task.radius, task.place_type) for task in self.__jobs_batch
             ]
 
-            # TODO
+            self.stats.tasks += len(rows)  # include number of poi inn stats
+
+            column_names = ["id", "lon", "lat", "radius", "place_type"]
+            self.__insert_rows(table=config.JOBS_TABLE, rows=rows, column_names=column_names)
+
             self.__jobs_batch = []
         else:
             self.print(f"ERROR: jobs batch is empty at the moment, cannot write any data!")
@@ -142,11 +170,12 @@ class DatabaseWriter(mp.Process):
                 (task.task_id, task.lon, task.lat, task.radius, task.place_type) for task in self.__success_batch
             ]
 
-            # TODO
+            column_names = ["id", "lon", "lat", "radius", "place_type"]
+            self.__insert_rows(table=config.SUCCESS_TABLE, rows=rows, column_names=column_names)
+
             self.__success_batch = []
         else:
             self.print(f"ERROR: success batch is empty at the moment, cannot write any data!")
-
 
     def __include_single_poi_data(self, data: PoiData):
 
@@ -156,21 +185,16 @@ class DatabaseWriter(mp.Process):
         self.__place_ids.add(data.place_id)
         self.__poi_batch.append(data)
 
+        if len(self.__poi_batch) >= self.__write_each:
+            self.__write_poi_batch()
 
-    # TODO remove
-    # def include_pois(self, data: List[PoiData]):
-    #
-    #     assert isinstance(data, list) and len(data) > 0, "received invalid PoiData array!"
-    #
-    #     for i in data:
-    #         if i.place_id not in self.__place_ids:
-    #             # limit to unique
-    #             self.__include_single_poi_data(data=i)
-    #
-    #     if len(self.__poi_batch) >= self.__write_each:
-    #         # first write POI data and only then acknowledge jobs as successful
-    #         self.__write_poi_batch()
-    #         self.__write_success_batch()
+    def __include_success_data(self, task: TaskDefinition):
+
+        self.__success_ids.add(task.task_id)
+        self.__success_batch.append(task)
+
+        if len(self.__success_batch) >= self.__write_each:
+            self.__write_success_batch()
 
     def set_success_ids(self, task_ids: List[str]):
 
@@ -182,11 +206,6 @@ class DatabaseWriter(mp.Process):
         for i in place_ids:
             self.__place_ids.add(i)
 
-    def include_success_data(self, data: TaskDefinition):
-
-        if data.task_id not in self.__success_ids:
-            self.__success_ids.add(data.task_id)
-            self.__success_batch.append(data)
 
     def cleanup_database(self):
 
@@ -195,37 +214,84 @@ class DatabaseWriter(mp.Process):
 
         self.conn.commit()
 
-    def get_from_queue_and_do_job(self):
+    def _get_poi_and_process(self):
 
         try:
-            poi: PoiData = self.queue.get(timeout=1)
+            poi: PoiData = self.poi_q.get(timeout=1)
         except Empty as e:
-            time.sleep(2)   # wait for new stuff in queue
+            time.sleep(2)   # wait for new stuff in queue (THIS queue, it is much busier)
             raise e
 
         if not isinstance(poi, PoiData):
-            self.print(f"{self.name}: received poison pill")
+            self.print(f"{self.name}: received poison pill from POI channel")
             self.finished = True
             raise FinishException('can finish')
 
+        self.stats.total_pois += 1      # count all including duplicates
         if poi.place_id not in self.__place_ids:
             self.__include_single_poi_data(data=poi)
 
+    def _get_complete_task_and_process(self):
+
+        try:
+            task: TaskDefinition = self.complete_tasks_q.get(timeout=0.1)
+        except Empty:
+            return   # don't do anything, this queue is not that busy
+
+        if not isinstance(task, TaskDefinition):
+            self.print(f"{self.name}: received poison pill from complete tasks channel")
+            self.finished = True
+            raise FinishException('can finish')
+
+        if task.task_id not in self.__success_ids:
+            self.__include_success_data(task=task)
 
     def run(self) -> None:
 
+        """ Main loop in thread. """
+
+        self.make_db_connection()
+        self.cursor = self.conn.cursor()
+
         while not self.finished:
 
-            try:
-                self.get_from_queue_and_do_job()
+            # first, check for tasks
+            if not self.complete_tasks_q.empty():
+                try:
+                    self._get_complete_task_and_process()
 
-            except Empty:
-                continue
+                except Empty:
+                    pass
 
-            except FinishException:
-                self.finished = True
-                break
+                except FinishException:
+                    self.finished = True
+                    break
 
+            # then, check for POI - and wait of nothing found
+            if not self.poi_q.empty():
+                try:
+                    self._get_poi_and_process()
+
+                except Empty:
+                    pass
+
+                except FinishException:
+                    self.finished = True
+                    break
+            else:
+                time.sleep(2)   # wait for the queue to fill
+
+        # make sure everything is recorded
+        if self.__poi_batch:
+            self.__write_poi_batch()
+
+        if self.__jobs_batch:
+            self.__write_jobs_batch()
+
+        if self.__success_batch:
+            self.__write_success_batch()
+
+        # when done
         self.cleanup_database()
         self.conn.close()
 

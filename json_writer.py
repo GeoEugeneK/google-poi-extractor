@@ -13,7 +13,7 @@ class RawResponseWriter(mp.Process):
 
     __info_each_n: int = 1000
 
-    def __init__(self, queue: mp.Queue, printlock: mp.Lock):
+    def __init__(self, poi_q: mp.Queue, printlock: mp.Lock):
 
         self.file_encoding = config.DEFAULT_ENCODING
         self.file_extension = config.RESPONSE_JSON_EXTENSION
@@ -25,7 +25,7 @@ class RawResponseWriter(mp.Process):
         assert os.path.exists(self.data_dir), f"invalid directory for raw data JSONs \"{self.data_dir}\""
 
         self.__printlock = printlock
-        self.queue = queue
+        self.poi_q = poi_q
         self.count = 0
 
         super().__init__(daemon=True, name="RawJsonWriterThread")
@@ -52,7 +52,7 @@ class RawResponseWriter(mp.Process):
         while not done:
 
             try:
-                task = self.queue.get(timeout=5)   # don't wait forever
+                task = self.poi_q.get(timeout=5)   # don't wait forever
             except Empty:
                 continue
 
@@ -67,4 +67,4 @@ class RawResponseWriter(mp.Process):
             if self.count % self.__info_each_n == 0:
                 self.print(f"{self.name}: data for {self.count} POIs were written as JSONs.")
 
-        self.print(f"{self.name}: writer done. Total {self.count} files written to disk. Exiting...")
+        self.print(f"{self.name}: writer done. Total {self.count} files written to disk in this session. Exiting...")

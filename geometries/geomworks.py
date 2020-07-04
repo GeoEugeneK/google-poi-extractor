@@ -89,20 +89,28 @@ def __assert_polygon(polygon: QgsGeometry):
     assert polygon.area() > 0, r"received polygon with zero area!"
 
 
-def make_grid(polygon: QgsGeometry, spacing: float) -> List[QgsPoint]:
+def make_grid(polygon: QgsGeometry, spacing: float, metric_epsg: int) -> List[QgsPoint]:
 
     """
 
     Helps create initial grid
 
-    :param polygon:     Valid singlepart polygon as QgsGeometry in metric CRS.
+    :param polygon:     Valid singlepart polygon as QgsGeometry in WGS 84 CRS.
     :param spacing:
     :return:
     """
 
+    assert metric_epsg > 0, f"invalid EPSG code {metric_epsg}"
+
     MIN_DIMENSION = 10  # only for the warning message
+    transformer = QgsCoordinateTransform(
+        QgsCoordinateReferenceSystem.fromEpsgId(epsg=4326),
+        QgsCoordinateReferenceSystem.fromEpsgId(epsg=metric_epsg),
+        QgsProject.instance()
+    )
 
     __assert_polygon(polygon)
+    polygon.transform(transformer, QgsCoordinateTransform.ForwardTransform)   # inplace
 
     # set bounds
     bbox: QgsRectangle = polygon.boundingBox()
@@ -139,6 +147,10 @@ def make_grid(polygon: QgsGeometry, spacing: float) -> List[QgsPoint]:
     print(
         f"INFO: total {len(points_within)} points selected out of "
         f"the original grid of {len(entire_grid)} points with spacing = {spacing:.1f}")
+
+    # project points back to WGS 84
+    for p in points_within:
+        p.transform(transformer, QgsCoordinateTransform.ReverseTransform)  # inplace
 
     return points_within
 
