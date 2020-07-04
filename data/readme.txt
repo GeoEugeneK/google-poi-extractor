@@ -1,0 +1,1 @@
+Raw response JSONs must be stored in this directory
