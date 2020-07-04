@@ -1,17 +1,19 @@
 import json
 import os
-import threading
-from queue import Empty, Queue
+# import threading
+from queue import Empty
+
+import multiprocessing as mp
 
 import config
 from dataclass import PoiData
 
 
-class RawResponseWriter(threading.Thread):
+class RawResponseWriter(mp.Process):
 
     __info_each_n: int = 1000
 
-    def __init__(self, tasks_queue: Queue, lock: threading.Lock):
+    def __init__(self, queue: mp.Queue, printlock: mp.Lock):
 
         self.file_encoding = config.DEFAULT_ENCODING
         self.file_extension = config.RESPONSE_JSON_EXTENSION
@@ -22,11 +24,15 @@ class RawResponseWriter(threading.Thread):
 
         assert os.path.exists(self.data_dir), f"invalid directory for raw data JSONs \"{self.data_dir}\""
 
-        self.lock = lock
-        self.queue = tasks_queue
+        self.__printlock = printlock
+        self.queue = queue
         self.count = 0
 
         super().__init__(daemon=True, name="RawJsonWriterThread")
+
+    def print(self, *args, **kwargs):
+        with self.__printlock:
+            print(*args, **kwargs)
 
     def write_poi_data(self, poi: PoiData):
 
@@ -40,8 +46,7 @@ class RawResponseWriter(threading.Thread):
 
     def run(self) -> None:
 
-        with self.lock:
-            print(f"{self.name}: writer started")
+        self.print(f"{self.name}: writer started")
 
         done = False
         while not done:
@@ -53,14 +58,13 @@ class RawResponseWriter(threading.Thread):
 
             # terminate process if poison pill found
             if not isinstance(task, PoiData):
+                self.print(f"{self.name} received poison pill")
                 done = True
                 break
 
             self.write_poi_data(task)
 
             if self.count % self.__info_each_n == 0:
-                with self.lock:
-                    print(f"{self.name}: data for {self.count} POIs were written as JSONs.")
+                self.print(f"{self.name}: data for {self.count} POIs were written as JSONs.")
 
-        with self.lock:
-            print(f"{self.name}: writer done. Total {self.count} files written to disk. Exiting...")
+        self.print(f"{self.name}: writer done. Total {self.count} files written to disk. Exiting...")

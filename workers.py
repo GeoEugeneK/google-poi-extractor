@@ -1,39 +1,104 @@
 import json
 import os
-from time import sleep
+import time
 
-import threading
+import multiprocessing as mp
+from queue import Empty
+from typing import List
+
 import googlemaps
 
 # from config import TRACKER_JSON, LANGUAGE
 import config
+from dataclass import PoiData
+from geometries.geomworks import Densifier
+from tasks import TaskDefinition
+
+from exceptions import *
 
 
-class GoogleWorker(threading.Thread):
-    """ One key per collector worker. """
+class StatsClass(object):
+
+    previous_requests: int
+    requests: int
+    tasks: int
+    critical_errors: int
+
+    zero_results: int
+    request_errors: int
+    recursions: int
+
+    avg_request_time: float
+    avg_task_time: float
+
+    def __init__(self):
+
+        self.requests = 0
+        self.critical_errors = 0
+        self.zero_results = 0
+        self.request_errors = 0
+        self.recursions = 0
+
+        self.avg_request_time = 0
+        self.avg_task_time = 0
+
+
+class GoogleWorker(mp.Process):
+
+    """ One API key per collector worker. """
+
+    key: str
+    job_done: bool = None
+    tasks_q: mp.Queue
+    database_q: mp.Queue
+    critical_errors_threshold: int = 10
+
+    __writelock: mp.Lock
+    __printlock: mp.Lock
 
     def __init__(self,
                  api_key: str,
-                 lock: threading.Lock,
-                 threadname: str,
-                 critical_error_threshold: int = 50,
+                 tasks_q: mp.Queue,
+                 database_q: mp.Queue,
+                 complete_tasks_q: mp.Queue,
+                 rawfile_q: mp.Queue,
+                 printlock: mp.Lock,
+                 writelock: mp.Lock
                  ):
-        super().__init__(daemon=True, name=threadname)
 
-        self.lock = lock
+        self.key = api_key
+        self.tasks_q: mp.Queue = tasks_q
+        self.database_q: mp.Queue = database_q
+        self.rawfile_q: mp.Queue = rawfile_q
+        self.complete_tasks_q: mp.Queue = complete_tasks_q
+
+        self.__writelock = writelock
+        self.__printlock = printlock
+
+        self.job_done = False
+        self.densifier = Densifier()
+
+        self.stats = StatsClass()
         self.maps = googlemaps.Client(key=api_key,
                                       queries_per_second=3,
                                       retry_over_query_limit=False,
                                       timeout=5)
 
-        self.job_done = False
+        super().__init__(daemon=True)
 
-        self.tracker = 0
-        self.critical_errors = 0
-        self.critical_error_threshold = critical_error_threshold
-        self.minor_errors = 0  # do we really need it?
+    def print(self, *args, **kwargs):
+        with self.__printlock:
+            print(*args, **kwargs)
 
-        self._prepare()
+    def print_info(self):
+
+        avg_request_ms = int(self.stats.avg_request_time * 1000)
+        avg_task_ms = int(self.stats.avg_task_time * 1000)
+        errors_cnt = self.stats.critical_errors + self.stats.request_errors
+
+        with self.__printlock:
+            print(f"{self.name}: {self.stats.tasks} tasks | {self.stats.requests} requests | "
+                  f"{errors_cnt} errors | {avg_request_ms} ms per request | {avg_task_ms} ms per task")
 
     def _prepare(self):
 
@@ -41,30 +106,28 @@ class GoogleWorker(threading.Thread):
         self._load_tracker()
         self._update_tracker()
 
-        with self.lock:
-            print(f'{self.name} started. {self.tracker} requests made in previous runs | Using API key {self.maps.key}')
+        self.print(f'{self.name} ready. {self.stats.previous_requests} requests made in previous runs | Using API key {self.maps.key}')
 
     def _load_tracker(self):
 
         """ Loads requests count from previous sessions. """
 
-        with self.lock:
-            if os.path.isfile(config.TRACKER_JSON):
-                with open(config.TRACKER_JSON, encoding='utf-8-sig') as f:
-                    d = json.loads(f.read())
-                try:
-                    self.tracker = d[self.maps.key]
-                except KeyError:
-                    self.tracker = 0
-            else:
-                self.tracker = 0
+        if os.path.isfile(config.TRACKER_JSON):
+            with self.__writelock, open(config.TRACKER_JSON, encoding='utf-8-sig') as f:
+                d = json.loads(f.read())
+            try:
+                self.stats.previous_requests = d[self.maps.key]
+            except KeyError:
+                self.stats.previous_requests = 0
+        else:
+            self.stats.previous_requests = 0
 
     def _update_tracker(self):
-        with self.lock, open(config.TRACKER_JSON, 'r+', encoding='utf-8-sig') as f:
+        with self.__writelock, open(config.TRACKER_JSON, 'r+', encoding='utf-8-sig') as f:
             trackerdict = json.loads(f.read())
             f.seek(0)  # return pointer to the beginning of file before writing'
 
-            trackerdict[self.maps.key] = self.tracker
+            trackerdict[self.maps.key] = self.stats.previous_requests + self.stats.requests
             json.dump(trackerdict, f)
 
     def _check_api_key(self):
@@ -82,120 +145,137 @@ class GoogleWorker(threading.Thread):
             )
         except Exception as e:
 
-            with self.lock:
-                print(f'ERROR: invalid API key "{self.maps.key}" (tracker={self.tracker})')
-            raise e
+            with self.__writelock:
+                self.print(f'ERROR: bad API key "{self.maps.key}" (tracker={self.stats.previous_requests})')
+                raise e
 
-    def _single_point_search(self, latlon: [tuple, list],
-                             radius: int,
-                             place_type: str = None,
-                             page_token=None,
-                             got_before=0,
-                             working_result: dict = None):
+    def search_task(self, task: TaskDefinition, page_token: str = None, got_before: int = 0):
 
-        resp = self.maps.places_nearby(location=latlon,
-                                       radius=radius,
+        page_token = page_token if page_token else None
+        got_before = got_before if got_before else None
+
+        location = (task.lat, task.lon)
+        _started = time.time()
+        resp = self.maps.places_nearby(location=location,
+                                       radius=task.radius,
                                        open_now=False,
                                        language=config.LANGUAGE,
-                                       type=place_type,
-                                       # rank_by='distance',         # IMPORTANT: cannot use rank_by and radius options together
+                                       type=task.place_type,
+                                       # rank_by='distance', # IMPORTANT: cannot use rank_by and radius options together
                                        page_token=page_token)
-        self.tracker += 1
 
-        if working_result is None:
-            working_result = {'xy': xy,
-                              'pois_tsv': [],
-                              'needs_recursion': False,
-                              'type': place_type,
-                              'radius': radius,
-                              }
+        # info timing
+        _elapsed = time.time() - _started
+        self.stats.avg_request_time = (_elapsed + self.stats.avg_request_time * self.stats.requests) / self.stats.requests + 1
+        self.stats.requests += 1
 
-        # VALIDATION
-        # check is everything ok
-        requests_status = resp['status'].upper()
-        if requests_status in ['OK', 'ZERO_RESULTS']:
-            pass
-
-        elif requests_status == 'OVER_QUERY_LIMIT':
-            self._update_tracker()
-            with self.lock:
-                raise Exception(
-                    f'Process {self.name} reached maximum allowed quota. For details, check your Google Developers Account\n'
-                    f'{self.tracker} requests made overall\n'
-                    f'API key used: {self.maps.key}'
-                    'Terminating...'
-                )
-
-        elif requests_status in ['INVALID_REQUEST', 'REQUEST_DENIED']:
-            self.critical_errors += 1
-            self._update_tracker()
-            with self.lock:
-                raise Exception(
-                    f'Bad request: {requests_status}\n'
-                    f'API key: {self.maps.key}\n'
-                    f'Params: xy={xy}, radius={radius}, type={place_type}, page_token={page_token}... '
-                )
-
-        # elif requests_status == 'UNKNOWN_ERROR':
-        else:  # basically means the above line
-
-            # don't bother much and put it back on queue
-            self.tasks_queue.put()  # TODO - put what exactly?
-
-        # parsing response
-        for poi in resp['results']:
-            geojsn_feat = extract_poi_data(poi=poi)
-            working_result['pois_tsv'].append(geojsn_feat)
-
+        # parse here
         try:
-            next_page_token = resp['next_page_token']
-        except KeyError:
-            next_page_token = None
+            pois: List[PoiData] = PoiData.from_response(resp=resp)
 
-        got_before = resp['results'].__len__() + got_before
+        except ZeroResultsException:
+            return []
+
+        except WastedQuotaException:
+            self.job_done = True
+            raise WastedQuotaException(
+                f'{self.name} reached maximum allowed quota. For details, check your Google Developers Account\n'
+                f'{self.stats.previous_requests} requests made overall\n'
+                f'API key used: {self.maps.key}'
+                'Terminating thread...'
+            )
+
+        except InvalidRequestException:
+            self.stats.critical_errors += 1
+            self.print(
+                    f"ERROR: invalid request exception in {self.name}. API key: {self.maps.key}\n"
+                    f"Params: location = {location}, radius={task.radius}, type={task.place_type}, page_token={page_token}... "
+            )
+            return []
+
+        except RequestDeniedException:
+            self.stats.critical_errors += 1
+            self.print(f"ERROR: request denied exception in {self.name}")
+            return []
+
+        next_page_token = resp.get("next_page_token")
+        got_for_the_task = len(pois) + got_before
+
         if next_page_token is None:
+
+            # no need to make more requests for this task
             if got_before >= 60:
-                working_result['needs_recursion'] = True
-            return working_result
+                # produce tasks for recursion if needed
+                self.submit_for_recursion(task=task)
+
+            return pois
         else:
             # at some point it reaches a state where next_page_token is None and returns all the results
-            return self._single_point_search(xy=xy,
-                                             radius=radius,
-                                             place_type=place_type,
-                                             page_token=page_token,
-                                             got_before=got_before,
-                                             working_result=working_result)
+            return pois + self.search_task(
+                task=task,
+                page_token=next_page_token,
+                got_before=got_for_the_task
+            )
+
+    def submit_for_recursion(self, task: TaskDefinition):
+
+        """ Makes new tasks for a parent search task that needs recursion. """
+
+        for t in self.densifier.densify(task=task):
+            self.tasks_q.put(t)
 
     def _get_from_queue_and_do_job(self):
-        with self.lock:
-            if not self.tasks_queue.empty():
-                search_task = self.tasks_queue.get()  # is an instance of PoiSearchTask
-                if search_task.made_loops < SINGLE_SEARCH_RETRIES_LIMIT:
-                    xy, place_type = search_task.xy, search_task.place_type
-                else:
-                    xy = None
-            else:
-                xy = None
 
-        if xy is None:
-            sleep(0.25)  # give it some rest
+        try:
+            #   will wait for N sec and throw Empty exception if nothing found
+            task: TaskDefinition = self.tasks_q.get(timeout=5)  # is an instance of PoiSearchTask
+        except Empty as e:
+            time.sleep(1)   # wait a bit for new tasks
+            raise e         # will repeat the main loop
 
-        # elif xy == (r'TERMINATE', r'TERMINATE'):
-        #     self.job_done = True
+        if not isinstance(task, TaskDefinition):
+            self.print(f"{self.name}: received poison pill")
+            self.job_done = True
+            raise FinishException('can finish')
 
         else:
-            result = self._single_point_search(xy=xy, place_type=place_type)
-            self.results_queue.put(result)
+            results = self.search_task(task=task)
+            for i in results:
+                assert isinstance(i, PoiData), "must be a PoiData instance!"
+                self.database_q.put(i)
+                self.rawfile_q.put(i)
+            self.complete_tasks_q.put(task)
 
     def run(self):
+
+        self._prepare()
+
+        self.print(f"{self.name} started")
+
         while not self.job_done:
-            if self.critical_errors > self.critical_error_threshold:
+
+            if self.stats.critical_errors > self.critical_errors_threshold:
                 raise Exception(
-                    f"Too many critical errors encountered ({self.critical_errors}). Terminating..."
+                    f"Too many critical errors encountered ({self.stats.critical_errors}). Terminating..."
                 )
-            self._get_from_queue_and_do_job()
-            if self.tracker % 10 == 0:
+
+            try:
+                _started = time.time()
+                self._get_from_queue_and_do_job()
+                _elapsed = time.time() - _started
+                self.stats.avg_task_time = (_elapsed + self.stats.tasks * self.stats.avg_task_time) / self.stats.tasks + 1
+                self.stats.tasks += 1
+
+            except Empty:
+                continue
+
+            except FinishException:
+                self.job_done = True
+                break
+
+            if self.stats.requests % 10 == 0:
                 self._update_tracker()
-        else:
-            self._update_tracker()
-            self.terminate()
+
+        # after the loop
+        self._update_tracker()
+

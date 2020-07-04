@@ -1,7 +1,7 @@
 # For better understanding, refer to expressions.py and see CREATE TABLE ... expression
 from typing import List
 
-from exceptions import InvalidPoiDataError, ResponseParsingError
+from exceptions import *
 
 
 NONE_TYPE = type(None)
@@ -162,6 +162,22 @@ class PoiData(object):
         Parses valid response JSON (dict) as a list of atomic POI data items.
         Must be used instead of default constructor.
         """
+
+        # first, validate
+        status = resp["status"]
+
+        if status == "OK":
+            pass    # everything is OK
+        elif status == "ZERO_RESULTS":
+            raise ZeroResultsException
+        elif status == "OVER_QUERY_LIMIT":
+            raise WastedQuotaException
+        elif status == 'REQUEST_DENIED':
+            raise RequestDeniedException
+        elif status == 'INVALID_REQUEST':
+            raise InvalidRequestException
+        else:
+            raise Exception(f"unexpected response status {status}")
 
         try:
             results = resp["results"]
