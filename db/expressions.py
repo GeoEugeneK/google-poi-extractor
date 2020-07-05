@@ -17,21 +17,13 @@ CREATE TABLE {POI_TABLE} (
                     vicinity TEXT,
                     types TEXT,
                     price INTEGER,
-                    /*  Extractor metadata  */
-                    date_obtained TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    needs_recurse BOOLEAN
-                    
-                    /*   NEW    */
-                    business_status TEXT, 
-                    
-                    
-                    
+                    business_status TEXT,
+                    date_obtained TIMESTAMP DEFAULT CURRENT_TIMESTAMP                   
                 );
 """
 
 
-CREATE_TASKS_TABLE = f"""
-DROP TABLE IF EXISTS {JOBS_TABLE};      /*  Drop data from previous session  */
+CREATE_JOBS_TABLE = f"""
 CREATE TABLE {JOBS_TABLE} (
                     id TEXT PRIMARY KEY,        -- random token
                     lon FLOAT,
@@ -42,7 +34,6 @@ CREATE TABLE {JOBS_TABLE} (
 """
 
 CREATE_SUCCESS_TABLE = f"""
-DROP TABLE IF EXISTS {SUCCESS_TABLE};   /*  Drop data from previous session  */
 CREATE TABLE {SUCCESS_TABLE} (
                         id TEXT PRIMARY KEY,    -- random token
                         lon FLOAT,
