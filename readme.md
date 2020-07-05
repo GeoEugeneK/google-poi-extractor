@@ -1,7 +1,7 @@
 Run:
 
-    `$ python main.py`
+`$ python main.py`
 
 or
 
-    `$ python3 main.py`
+`$ python3 main.py`
