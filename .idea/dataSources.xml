@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="DataSourceManagerImpl" format="xml" multifile-model="true">
+    <data-source source="LOCAL" name="SQLite - poi.sqlite3" uuid="258cc430-da84-4229-940f-77f099dc2642">
+      <driver-ref>sqlite.xerial</driver-ref>
+      <synchronize>true</synchronize>
+      <remarks>working database for POI extraction</remarks>
+      <jdbc-driver>org.sqlite.JDBC</jdbc-driver>
+      <jdbc-url>jdbc:sqlite:D:\gis_works3\google-poi-extractor\poi.sqlite3</jdbc-url>
+    </data-source>
+  </component>
+</project>

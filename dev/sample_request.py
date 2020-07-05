@@ -1,4 +1,5 @@
 import googlemaps
+
 from dataclass import PoiData
 
 API_KEY = r"AIzaSyAih3qyStqQpzZkB9R0Oo7D9GJWMUW2iWQ"

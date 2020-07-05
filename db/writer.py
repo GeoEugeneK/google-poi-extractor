@@ -2,17 +2,14 @@ import multiprocessing as mp
 import os
 import sqlite3
 import time
+from queue import Empty
 from typing import List, Set
 
 import config
-from queue import Empty
 from dataclass import PoiData
 from db.expressions import CREATE_POI_TABLE, DROP_JOBS, DROP_SUCCESS
 from exceptions import InvalidPoiDataError, FinishException
 from tasks import TaskDefinition
-
-
-print(f"INFO: using sqlite3 lib v.{sqlite3.version}")
 
 
 class StatsClass(object):
@@ -20,12 +17,14 @@ class StatsClass(object):
     total_pois: int
     unique_pois: int
     tasks: int
+    inserts: int
 
     def __init__(self):
 
         self.total_pois = 0
         self.unique_pois = 0
         self.tasks = 0
+        self.inserts = 0
 
 
 class DatabaseWriter(mp.Process):
@@ -40,6 +39,7 @@ class DatabaseWriter(mp.Process):
     __place_ids: Set[str]       # will hold until the end of session - helps avoid repeating POIs
 
     __write_each: int = 100     # only applies to POIs (PoiData class instances)
+    __commit_each: int = 12     # make commit each N inserts
 
     finished: bool = None
     __printlock: mp.Lock
@@ -115,7 +115,6 @@ class DatabaseWriter(mp.Process):
         """ Creates table that  """
 
         self.cursor.execute(sql=CREATE_POI_TABLE)
-        self.conn.commit()
 
     def __insert_rows(self, table: str,  rows: List[tuple], column_names: List[str]):
 
@@ -123,7 +122,13 @@ class DatabaseWriter(mp.Process):
         columns = ",".join(column_names)
         sql = f"""INSERT INTO {table} ({columns}) VALUES ({question_marks});"""
         self.cursor.execute(sql=sql)
-        self.conn.commit()
+
+        self.stats.inserts += 1
+
+        if self.stats.inserts % self.__commit_each == 0:
+            self.conn.commit()
+            if config.DEBUG:
+                self.print(f"{self.name}: database commit")
 
     def __write_poi_batch(self):
 
@@ -142,6 +147,9 @@ class DatabaseWriter(mp.Process):
             self.__insert_rows(table=config.POI_TABLE, rows=rows, column_names=column_names)
 
             self.__poi_batch = []
+            if config.DEBUG:
+                self.print(f"{self.name}: inserted {len(rows)} rows into POI table")
+
         else:
             self.print(f"ERROR: POI batch is empty at the moment, cannot write any data!")
 
@@ -159,6 +167,9 @@ class DatabaseWriter(mp.Process):
             self.__insert_rows(table=config.JOBS_TABLE, rows=rows, column_names=column_names)
 
             self.__jobs_batch = []
+            if config.DEBUG:
+                self.print(f"{self.name}: inserted {len(rows)} rows into jobs table")
+
         else:
             self.print(f"ERROR: jobs batch is empty at the moment, cannot write any data!")
 
@@ -174,6 +185,9 @@ class DatabaseWriter(mp.Process):
             self.__insert_rows(table=config.SUCCESS_TABLE, rows=rows, column_names=column_names)
 
             self.__success_batch = []
+            if config.DEBUG:
+                self.print(f"{self.name}: inserted {len(rows)} rows into successful tasks table")
+
         else:
             self.print(f"ERROR: success batch is empty at the moment, cannot write any data!")
 
@@ -238,6 +252,9 @@ class DatabaseWriter(mp.Process):
         except Empty:
             return   # don't do anything, this queue is not that busy
 
+        if config.DEBUG:
+            self.print(f"{self.name}: found completed task")
+
         if not isinstance(task, TaskDefinition):
             self.print(f"{self.name}: received poison pill from complete tasks channel")
             self.finished = True
@@ -245,6 +262,9 @@ class DatabaseWriter(mp.Process):
 
         if task.task_id not in self.__success_ids:
             self.__include_success_data(task=task)
+            if config.DEBUG:
+                self.print(f"{self.name}: new task, including into the database")
+
 
     def run(self) -> None:
 

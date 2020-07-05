@@ -15,9 +15,15 @@ TASKS_FILE = f""    # additional parameter needed to resume correctly. Ignored w
 
 RAW_DATA_FOLDER = "./data/"     # raw response JSONs
 RESPONSE_JSON_EXTENSION = ".json"
-AOI_LAYER_URI = ""       # must be of Polygon geometry type, only the first feature will be picked
-INITIAL_RADIUS = 650
 
-METRIC_CRS_EPSG = 32634     # utm 34N
+# must be of Polygon geometry type, only the first feature will be picked
+AOI_LAYER_URI = "D:/gis_works2/buildingsOSM.gpkg|layername=border_wgs84"        # simply put, city boundaries
+
+INITIAL_RADIUS = 650
+MIN_ALLOWED_RADIUS = 6     # meters    |   avoid infinite search point recursion!
+
+METRIC_CRS_EPSG = 32635     # utm 34N
 DEFAULT_ENCODING = "utf-8"
 LANGUAGE = 'ru'
+
+DEBUG = True    # will suppress some messages when disabled

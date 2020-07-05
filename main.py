@@ -1,14 +1,12 @@
 import multiprocessing as mp
-# import threading
 import sqlite3
 import sys
 import time
-import timing
-
 from typing import List
 
 import config
 import resume
+import timing
 from api import get_api_keys
 from db.connect import make_db_connection
 from db.writer import DatabaseWriter
@@ -27,14 +25,14 @@ def make_initial_tasks() -> List[TaskDefinition]:
 
     """ Gets AOI polygon from specified layer, makes initial grid and creates initial tasks."""
 
-    assert config.AOI_LAYER_URI and isinstance(config.AOI_LAYER_URI), \
+    assert config.AOI_LAYER_URI and isinstance(config.AOI_LAYER_URI, str), \
         f'invalid layer URI {config.AOI_LAYER_URI}, see config to fix'
 
     # derive spacing
     spacing = config.INITIAL_RADIUS * 2 / (2 ** 0.5)
 
     aoi_polygon = get_aoi_polygon(config.AOI_LAYER_URI)
-    initial_points = make_grid(aoi_polygon, spacing=spacing)
+    initial_points = make_grid(aoi_polygon, spacing=spacing, metric_epsg=config.METRIC_CRS_EPSG)
 
     # figure out the types
     all_types = get_valid_types()
@@ -134,6 +132,8 @@ def main():
     for t in tasks:
         tasks_q.put(t)
 
+    conn.close()    # close connection in this thread
+
     # get keys
     keys = get_api_keys()
     assert keys, "no keys can be used!"
@@ -177,6 +177,7 @@ def main():
 
 if __name__ == '__main__':
 
+    print("MAIN: getting to work")
     started = time.time()
 
     main()  # does all the job

@@ -3,7 +3,6 @@ from typing import List
 
 from exceptions import *
 
-
 NONE_TYPE = type(None)
 
 
@@ -67,13 +66,13 @@ class PoiData(object):
             assert self.__item_valid(item=self.scope, itemtype=str, not_null=True), \
                 f'invalid value for scope "{self.scope}" (type {type(self.scope)})'
 
-            assert self.__item_valid(item=self.vicinity, itemtype=str, not_null=True), \
+            assert self.__item_valid(item=self.vicinity, itemtype=str, not_null=False), \
                 f'invalid value for vicinity "{self.vicinity}" (type {type(self.vicinity)})'
 
             assert self.__item_valid(item=self.types, itemtype=str, not_null=True), \
                 f'invalid value for types "{self.types}" (type {type(self.types)})'
 
-            assert self.__item_valid(item=self.business_status, itemtype=str, not_null=True), \
+            assert self.__item_valid(item=self.business_status, itemtype=str, not_null=False), \
                 f'invalid value for business_status "{self.business_status}" (type {type(self.business_status)})'
 
             # numeric
@@ -84,7 +83,7 @@ class PoiData(object):
             assert self.__item_valid(item=self.lat, itemtype=float, not_null=True), \
                 f'invalid value for lat "{self.lat}" (type {type(self.lat)})'
 
-            assert self.__item_valid(item=self.rating, itemtype=(float, int, NONE_TYPE), not_null=True), \
+            assert self.__item_valid(item=self.rating, itemtype=(float, int, NONE_TYPE), not_null=False), \
                 f'invalid value for rating "{self.rating}" (type {type(self.rating)})'
 
             assert self.__item_valid(item=self.user_ratings_total, itemtype=(int, NONE_TYPE), not_null=False), \

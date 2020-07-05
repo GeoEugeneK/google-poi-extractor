@@ -1,5 +1,5 @@
-import sqlite3
 import os
+import sqlite3
 
 print(f"INFO: using sqlite3 lib v.{sqlite3.version}")
 

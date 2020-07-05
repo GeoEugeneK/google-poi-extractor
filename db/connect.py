@@ -6,6 +6,8 @@ def make_db_connection(db_file: str):
 
     """ Creates a database connection to a SQLite database. Raises error when fails to connect. """
 
+    print(f"INFO: using sqlite3 lib v.{sqlite3.version}")   # info
+
     conn = None
     db_basename = os.path.basename(db_file)
     parent_dir = os.path.dirname(os.path.abspath(db_file))

@@ -1,11 +1,12 @@
+import itertools
+import math
 from typing import List
 
 from qgis.core import *
 
-from tasks import TaskDefinition
 import config
-
-import itertools
+from exceptions import SearchRecursionError
+from tasks import TaskDefinition
 
 
 class Densifier(object):
@@ -37,6 +38,11 @@ class Densifier(object):
 
     def densify(self, task: TaskDefinition) -> List[TaskDefinition]:
 
+        # check if further recursion is possible
+        radius = task.radius / 2
+        if radius <= config.MIN_ALLOWED_RADIUS:
+            raise SearchRecursionError
+
         wgs_point = QgsPointXY(task.lon, task.lat)
         metric_point: QgsPointXY = self.transformer_to_metric.transform(wgs_point)
 
@@ -45,10 +51,8 @@ class Densifier(object):
         densified_metric = [metric_point.project(distance, a) for a in self.DENSIFY_ANGLES]
         densified_wgs = [self.transformer_to_wgs.transform(pt) for pt in densified_metric]
 
-        radius = task.radius / 2
-
         # as well, include the center point with smaller radius
-        task_for_center = TaskDefinition(task.lon, task.lat, task.radius * 0.4, task.place_type)
+        task_for_center = TaskDefinition(task.lon, task.lat, radius * 0.75, task.place_type)
 
         return [
             TaskDefinition(
@@ -65,7 +69,7 @@ def __buffer_intersects(point: [QgsPoint, QgsPointXY], polygon: QgsGeometry, buf
     assert buffer_by > 0, f"buffer distance must be greater than zero!"
 
     if isinstance(point, QgsPoint):
-        point_as_geom = QgsGeometry(point)
+        point_as_geom = QgsGeometry.fromPointXY(QgsPointXY(point.x(), point.y()))
     elif isinstance(point, QgsPointXY):
         point_as_geom = QgsGeometry.fromPointXY(point)
     else:
@@ -117,8 +121,8 @@ def make_grid(polygon: QgsGeometry, spacing: float, metric_epsg: int) -> List[Qg
     xmin, xmax, ymin, ymax = bbox.xMinimum(), bbox.xMaximum(), bbox.yMinimum(), bbox.yMaximum()
 
     # calculate grid
-    n_rows = (xmax - xmin) // spacing
-    n_columns = (xmax - xmin) // spacing
+    n_rows = math.ceil((xmax - xmin) // spacing)
+    n_columns = math.ceil((xmax - xmin) / spacing)
 
     if n_rows == 0 or n_columns == 0:
         raise Exception(
@@ -135,7 +139,7 @@ def make_grid(polygon: QgsGeometry, spacing: float, metric_epsg: int) -> List[Qg
 
     else:
         print(
-            f"WARN: creating grid with rows x columns x {n_rows} x {n_columns}"
+            f"WARN: creating grid with rows x columns = {n_rows} x {n_columns}"
         )
 
     x_columns = [xmin + spacing * i for i in range(0, n_columns + 1)]   # make a little extra
@@ -146,13 +150,19 @@ def make_grid(polygon: QgsGeometry, spacing: float, metric_epsg: int) -> List[Qg
 
     print(
         f"INFO: total {len(points_within)} points selected out of "
-        f"the original grid of {len(entire_grid)} points with spacing = {spacing:.1f}")
+        f"the original grid of {len(entire_grid)} points with spacing = {spacing:.1f} m")
 
     # project points back to WGS 84
+    points_within_wgs84 = []
     for p in points_within:
-        p.transform(transformer, QgsCoordinateTransform.ReverseTransform)  # inplace
+        geom = QgsGeometry(p)
+        geom.transform(transformer, QgsCoordinateTransform.ReverseTransform)
+        points_within_wgs84.append(geom.asPoint())
+        # p.transform(transformer, QgsCoordinateTransform.ReverseTransform)  # inplace
 
-    return points_within
+    del transformer
+
+    return points_within_wgs84
 
 
 def get_aoi_polygon(layer_uri: str):
@@ -162,7 +172,7 @@ def get_aoi_polygon(layer_uri: str):
 
     assert lyr.isValid(), "layer is invalid!"
     assert lyr.featureCount() > 0, "no features found in layer"
-    assert lyr.crs().authid().lower() != "epsg:4326", f'layer CRS must be WGS 84 (EPSG:4326), received {lyr.crs().authid()}'
+    assert lyr.crs().authid().lower() == "epsg:4326", f'layer CRS must be WGS 84 (EPSG:4326), received {lyr.crs().authid()}'
 
     geoms = [ft.geometry() for ft in lyr.getFeatures()]
 

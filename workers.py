@@ -30,7 +30,9 @@ class StatsClass(object):
 
     def __init__(self):
 
+        self.previous_requests = 0
         self.requests = 0
+        self.tasks = 0
         self.critical_errors = 0
         self.zero_results = 0
         self.request_errors = 0
@@ -53,6 +55,8 @@ class GoogleWorker(mp.Process):
     __writelock: mp.Lock
     __printlock: mp.Lock
 
+    __info_each: int = 5
+
     def __init__(self,
                  api_key: str,
                  tasks_q: mp.Queue,
@@ -73,7 +77,7 @@ class GoogleWorker(mp.Process):
         self.__printlock = printlock
 
         self.job_done = False
-        self.densifier = Densifier()
+        self.densifier: Densifier = None   # initialize in a separate thread
 
         self.stats = StatsClass()
         self.maps = googlemaps.Client(key=api_key,
@@ -99,6 +103,7 @@ class GoogleWorker(mp.Process):
 
     def _prepare(self):
 
+        self.densifier = Densifier()
         self._check_api_key()
         self._load_tracker()
         self._update_tracker()
@@ -143,13 +148,16 @@ class GoogleWorker(mp.Process):
         except Exception as e:
 
             with self.__writelock:
-                self.print(f'ERROR: bad API key "{self.maps.key}" (tracker={self.stats.previous_requests})')
+                self.print(f'ERROR: bad API key "{self.maps.key}" (tracker={self.stats.previous_requests})\n')
                 raise e
 
     def search_task(self, task: TaskDefinition, page_token: str = None, got_before: int = 0):
 
+        if config.DEBUG:
+            self.print(f"{self.name}: got task")
+
         page_token = page_token if page_token else None
-        got_before = got_before if got_before else None
+        got_before = got_before if got_before else 0
 
         location = (task.lat, task.lon)
         _started = time.time()
@@ -163,7 +171,7 @@ class GoogleWorker(mp.Process):
 
         # info timing
         _elapsed = time.time() - _started
-        self.stats.avg_request_time = (_elapsed + self.stats.avg_request_time * self.stats.requests) / self.stats.requests + 1
+        self.stats.avg_request_time = (_elapsed + self.stats.avg_request_time * self.stats.requests) / (self.stats.requests + 1)
         self.stats.requests += 1
 
         # parse here
@@ -173,7 +181,7 @@ class GoogleWorker(mp.Process):
         except ZeroResultsException:
             return []
 
-        except WastedQuotaException:
+        except (googlemaps.exceptions._OverQueryLimit, WastedQuotaException):
             self.job_done = True
             raise WastedQuotaException(
                 f'{self.name} reached maximum allowed quota. For details, check your Google Developers Account\n'
@@ -195,8 +203,16 @@ class GoogleWorker(mp.Process):
             self.print(f"ERROR: request denied exception in {self.name}")
             return []
 
+        except googlemaps.exceptions.ApiError:
+            self.stats.critical_errors += 1
+            self.print(f"ERROR: API error occurred in {self.name}")
+            return []
+
         next_page_token = resp.get("next_page_token")
         got_for_the_task = len(pois) + got_before
+
+        if config.DEBUG:
+            self.print(f"{self.name}: {got_for_the_task} POIs retrieved (next page = {not not next_page_token})")
 
         if next_page_token is None:
 
@@ -204,6 +220,9 @@ class GoogleWorker(mp.Process):
             if got_before >= 60:
                 # produce tasks for recursion if needed
                 self.submit_for_recursion(task=task)
+
+            if config.DEBUG:
+                self.print(f"{self.name}: task complete")
 
             return pois
         else:
@@ -218,8 +237,12 @@ class GoogleWorker(mp.Process):
 
         """ Makes new tasks for a parent search task that needs recursion. """
 
-        for t in self.densifier.densify(task=task):
-            self.tasks_q.put(t)
+        try:
+            densified_tasks = self.densifier.densify(task=task)
+            for t in densified_tasks:
+                self.tasks_q.put(t)
+        except SearchRecursionError:
+            pass    # just skip these if no recursion possible
 
     def _get_from_queue_and_do_job(self):
 
@@ -245,9 +268,8 @@ class GoogleWorker(mp.Process):
 
     def run(self):
 
-        self._prepare()
-
         self.print(f"{self.name} started")
+        self._prepare()
 
         while not self.job_done:
 
@@ -260,8 +282,11 @@ class GoogleWorker(mp.Process):
                 _started = time.time()
                 self._get_from_queue_and_do_job()
                 _elapsed = time.time() - _started
-                self.stats.avg_task_time = (_elapsed + self.stats.tasks * self.stats.avg_task_time) / self.stats.tasks + 1
+                self.stats.avg_task_time = (_elapsed + self.stats.tasks * self.stats.avg_task_time) / (self.stats.tasks + 1)
                 self.stats.tasks += 1
+
+                if self.stats.tasks % self.__info_each == 0:
+                    self.print_info()
 
             except Empty:
                 continue

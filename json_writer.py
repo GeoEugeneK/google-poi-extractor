@@ -1,9 +1,8 @@
 import json
+import multiprocessing as mp
 import os
 # import threading
 from queue import Empty
-
-import multiprocessing as mp
 
 import config
 from dataclass import PoiData
