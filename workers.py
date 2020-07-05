@@ -14,10 +14,14 @@ from geometries.geomworks import Densifier
 from tasks import TaskDefinition
 
 
+MIN_REQUEST_INTERVAL = 60 / config.MAX_REQUESTS_PER_MIN  # seconds
+
+
 class StatsClass(object):
 
     previous_requests: int
     requests: int
+    pois: int
     tasks: int
     critical_errors: int
 
@@ -32,6 +36,7 @@ class StatsClass(object):
 
         self.previous_requests = 0
         self.requests = 0
+        self.pois = 0
         self.tasks = 0
         self.critical_errors = 0
         self.zero_results = 0
@@ -49,7 +54,7 @@ class GoogleWorker(mp.Process):
     key: str
     job_done: bool = None
     tasks_q: mp.Queue
-    database_q: mp.Queue
+    poi_db_q: mp.Queue
     critical_errors_threshold: int = 10
 
     __writelock: mp.Lock
@@ -60,6 +65,7 @@ class GoogleWorker(mp.Process):
     def __init__(self,
                  api_key: str,
                  tasks_q: mp.Queue,
+                 tasks_for_record_q: mp.Queue,
                  database_q: mp.Queue,
                  complete_tasks_q: mp.Queue,
                  rawfile_q: mp.Queue,
@@ -69,7 +75,8 @@ class GoogleWorker(mp.Process):
 
         self.key = api_key
         self.tasks_q: mp.Queue = tasks_q
-        self.database_q: mp.Queue = database_q
+        self.tasks_database_q = tasks_for_record_q
+        self.poi_db_q: mp.Queue = database_q
         self.rawfile_q: mp.Queue = rawfile_q
         self.complete_tasks_q: mp.Queue = complete_tasks_q
 
@@ -84,6 +91,7 @@ class GoogleWorker(mp.Process):
                                       queries_per_second=3,
                                       retry_over_query_limit=False,
                                       timeout=5)
+        self.__ignore_taks = set()
 
         super().__init__(daemon=True)
 
@@ -96,10 +104,18 @@ class GoogleWorker(mp.Process):
         avg_request_ms = int(self.stats.avg_request_time * 1000)
         avg_task_ms = int(self.stats.avg_task_time * 1000)
         errors_cnt = self.stats.critical_errors + self.stats.request_errors
+        avg_pois = self.stats.pois / self.stats.tasks
+        requests_per_minute = 60 / self.stats.avg_task_time
 
         with self.__printlock:
             print(f"{self.name}: {self.stats.tasks} tasks | {self.stats.requests} requests | "
-                  f"{errors_cnt} errors | {avg_request_ms} ms per request | {avg_task_ms} ms per task")
+                  f"{self.stats.pois} POIs | {avg_pois:.1f} POIs per task avg | "
+                  f"{errors_cnt} errors | {requests_per_minute:.1f} req per min | "
+                  f"{avg_request_ms} ms per request | {avg_task_ms} ms per task")
+
+    def write_traceback(self, e: Exception):
+        with self.__printlock:
+            write_traceback(e=e, file=config.TB_FILE)
 
     def _prepare(self):
 
@@ -153,35 +169,44 @@ class GoogleWorker(mp.Process):
 
     def search_task(self, task: TaskDefinition, page_token: str = None, got_before: int = 0):
 
-        if config.DEBUG:
-            self.print(f"{self.name}: got task")
+        # if config.DEBUG:
+        #     self.print(f"{self.name}: got task")
+        task.tries += 1
 
-        page_token = page_token if page_token else None
         got_before = got_before if got_before else 0
 
         location = (task.lat, task.lon)
         _started = time.time()
-        resp = self.maps.places_nearby(location=location,
-                                       radius=task.radius,
-                                       open_now=False,
-                                       language=config.LANGUAGE,
-                                       type=task.place_type,
-                                       # rank_by='distance', # IMPORTANT: cannot use rank_by and radius options together
-                                       page_token=page_token)
-
-        # info timing
-        _elapsed = time.time() - _started
-        self.stats.avg_request_time = (_elapsed + self.stats.avg_request_time * self.stats.requests) / (self.stats.requests + 1)
         self.stats.requests += 1
 
         # parse here
         try:
+            if not page_token:
+                resp = self.maps.places_nearby(location=location,
+                                               radius=task.radius,
+                                               open_now=False,
+                                               language=config.LANGUAGE,
+                                               type=task.place_type)
+            else:
+                resp = self.maps.places_nearby(page_token=page_token)
+
+            # info timing
+            _elapsed = time.time() - _started
+            self.stats.avg_request_time = (_elapsed + self.stats.avg_request_time * self.stats.requests) / (
+                        self.stats.requests + 1)
+
             pois: List[PoiData] = PoiData.from_response(resp=resp)
+
+            # ensure gaps between requests
+            if _elapsed < MIN_REQUEST_INTERVAL:
+                time.sleep(MIN_REQUEST_INTERVAL - _elapsed)  # wait the rest of time
+            time.sleep(0.15)   # as well, sleep for another 150 ms
 
         except ZeroResultsException:
             return []
 
-        except (googlemaps.exceptions._OverQueryLimit, WastedQuotaException):
+        except (googlemaps.exceptions._OverQueryLimit, WastedQuotaException) as e:
+            self.write_traceback(e)
             self.job_done = True
             raise WastedQuotaException(
                 f'{self.name} reached maximum allowed quota. For details, check your Google Developers Account\n'
@@ -190,39 +215,56 @@ class GoogleWorker(mp.Process):
                 'Terminating thread...'
             )
 
-        except InvalidRequestException:
+        except InvalidRequestException as e:
+            self.write_traceback(e)
             self.stats.critical_errors += 1
             self.print(
                     f"ERROR: invalid request exception in {self.name}. API key: {self.maps.key}\n"
-                    f"Params: location = {location}, radius={task.radius}, type={task.place_type}, page_token={page_token}... "
+                    f"Params: location = {location}, radius={task.radius}, type={task.place_type}, "
+                    f"page_token={page_token}, got_before = {got_before} "
             )
             return []
 
-        except RequestDeniedException:
+        except RequestDeniedException as e:
+            self.write_traceback(e)
             self.stats.critical_errors += 1
-            self.print(f"ERROR: request denied exception in {self.name}")
+            self.print(
+                f"ERROR: request denied exception in {self.name}\n"
+                f"Params: location = {location}, radius={task.radius}, type={task.place_type}, "
+                f"page_token={page_token}, got_before = {got_before} "
+                       )
             return []
 
-        except googlemaps.exceptions.ApiError:
+        except googlemaps.exceptions.ApiError as e:
+            self.write_traceback(e)
             self.stats.critical_errors += 1
-            self.print(f"ERROR: API error occurred in {self.name}")
+            self.print(
+                f"ERROR: API error occurred in {self.name}\n"
+                f"Params: location = {location}, radius={task.radius}, type={task.place_type}, "
+                f"page_token={page_token}, got_before = {got_before} "
+            )
+            raise e         # TODO fix
             return []
 
         next_page_token = resp.get("next_page_token")
         got_for_the_task = len(pois) + got_before
 
-        if config.DEBUG:
-            self.print(f"{self.name}: {got_for_the_task} POIs retrieved (next page = {not not next_page_token})")
+        # if config.DEBUG:
+        #     self.print(f"{self.name}: {got_for_the_task} POIs retrieved (next page = {not not next_page_token})")
+
+        self.stats.pois += len(pois)
 
         if next_page_token is None:
 
             # no need to make more requests for this task
             if got_before >= 60:
                 # produce tasks for recursion if needed
+                if config.DEBUG:
+                    self.print(f"{self.name}: submitting task for recursion")
                 self.submit_for_recursion(task=task)
 
-            if config.DEBUG:
-                self.print(f"{self.name}: task complete")
+            # if config.DEBUG:
+            #     self.print(f"{self.name}: task complete")
 
             return pois
         else:
@@ -240,7 +282,8 @@ class GoogleWorker(mp.Process):
         try:
             densified_tasks = self.densifier.densify(task=task)
             for t in densified_tasks:
-                self.tasks_q.put(t)
+                self.tasks_q.put(t)     # for processing
+                self.tasks_database_q.put(t)    # for record in the database
         except SearchRecursionError:
             pass    # just skip these if no recursion possible
 
@@ -258,11 +301,14 @@ class GoogleWorker(mp.Process):
             self.job_done = True
             raise FinishException('can finish')
 
+        elif task.tries >= config.MAX_TRIES_WITH_TASK:
+            return    # discard
+
         else:
             results = self.search_task(task=task)
             for i in results:
                 assert isinstance(i, PoiData), "must be a PoiData instance!"
-                self.database_q.put(i)
+                self.poi_db_q.put(i)
                 self.rawfile_q.put(i)
             self.complete_tasks_q.put(task)
 
@@ -285,6 +331,7 @@ class GoogleWorker(mp.Process):
                 self.stats.avg_task_time = (_elapsed + self.stats.tasks * self.stats.avg_task_time) / (self.stats.tasks + 1)
                 self.stats.tasks += 1
 
+
                 if self.stats.tasks % self.__info_each == 0:
                     self.print_info()
 
@@ -295,7 +342,7 @@ class GoogleWorker(mp.Process):
                 self.job_done = True
                 break
 
-            if self.stats.requests % 10 == 0:
+            if self.stats.requests % 4 == 0:    # update tracker every N
                 self._update_tracker()
 
         # after the loop

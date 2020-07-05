@@ -10,6 +10,7 @@ import timing
 from api import get_api_keys
 from db.connect import make_db_connection
 from db.writer import DatabaseWriter
+from db import expressions
 from geometries.geomworks import make_grid, get_aoi_polygon
 from json_writer import RawResponseWriter
 from placetypes import get_search_types, get_valid_types
@@ -17,8 +18,18 @@ from tasks import TaskDefinition
 from workers import GoogleWorker
 
 
-def prepare_database():
-    pass
+
+def prepare_database(cursor: sqlite3.Cursor):
+
+    """ Drop and make new tables """
+
+    cursor.execute(expressions.DROP_SUCCESS)
+    cursor.execute(expressions.DROP_JOBS)
+
+    # create new
+    cursor.execute(expressions.CREATE_POI_TABLE)
+    cursor.execute(expressions.CREATE_SUCCESS_TABLE)
+    cursor.execute(expressions.CREATE_JOBS_TABLE)
 
 
 def make_initial_tasks() -> List[TaskDefinition]:
@@ -103,6 +114,7 @@ def main():
 
     # queues
     tasks_q = mp.Queue()
+    tasks_for_record_q = mp.Queue()
     database_q = mp.Queue()
     complete_q = mp.Queue()
     raw_json_q = mp.Queue()
@@ -112,7 +124,7 @@ def main():
     printlock = mp.Lock()
 
     # make writers, but don't launch yet
-    db_writer = DatabaseWriter(db_file=config.DATABASE, poi_q=database_q,
+    db_writer = DatabaseWriter(db_file=config.DATABASE, poi_q=database_q, tasks_q=tasks_for_record_q,
                                complete_tasks_q=complete_q, printlock=printlock)
     raw_writer = RawResponseWriter(poi_q=raw_json_q, printlock=printlock)
 
@@ -126,11 +138,19 @@ def main():
         db_writer.set_success_ids(["dummy"])
 
     else:
+        tables = resume.get_existing_tables(cursor=cursor)
+        if config.POI_TABLE in tables:
+            raise Exception(f"ERROR: table {config.POI_TABLE} already exists. "
+                            f"You must remove it manually or use a different table name")
         tasks = make_initial_tasks()                        # initial_tasks
+        prepare_database(cursor=cursor)
 
     # fill queue
     for t in tasks:
         tasks_q.put(t)
+
+    # also include in all jobs table
+    db_writer.set_initial_jobs(jobs=tasks)
 
     conn.close()    # close connection in this thread
 
@@ -145,7 +165,7 @@ def main():
     # start worker threads
     collectors = []
     for n, k in enumerate(keys):
-        t = GoogleWorker(api_key=k, tasks_q=tasks_q, database_q=database_q,
+        t = GoogleWorker(api_key=k, tasks_q=tasks_q, tasks_for_record_q=tasks_for_record_q, database_q=database_q,
                          complete_tasks_q=complete_q, rawfile_q=raw_json_q, printlock=printlock, writelock=writelock)
         t.start()
         time.sleep(1)   # wait between starts

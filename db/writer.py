@@ -7,9 +7,23 @@ from typing import List, Set
 
 import config
 from dataclass import PoiData
-from db.expressions import CREATE_POI_TABLE, DROP_JOBS, DROP_SUCCESS
+from db.expressions import CREATE_POI_TABLE, CREATE_SUCCESS_TABLE, CREATE_JOBS_TABLE, DROP_JOBS, DROP_SUCCESS
 from exceptions import InvalidPoiDataError, FinishException
 from tasks import TaskDefinition
+
+
+POI_WRITEABLE_COLUMNS = ['place_id',
+                         'id',
+                         'lon',
+                         'lat',
+                         'name',
+                         'rating',
+                         'scope',
+                         'user_ratings_total',
+                         'vicinity',
+                         'types',
+                         'price',
+                         'business_status']
 
 
 class StatsClass(object):
@@ -18,6 +32,7 @@ class StatsClass(object):
     unique_pois: int
     tasks: int
     inserts: int
+    commits: int
 
     def __init__(self):
 
@@ -25,6 +40,7 @@ class StatsClass(object):
         self.unique_pois = 0
         self.tasks = 0
         self.inserts = 0
+        self.commits = 0
 
 
 class DatabaseWriter(mp.Process):
@@ -33,6 +49,7 @@ class DatabaseWriter(mp.Process):
     cursor: sqlite3.Cursor
 
     __poi_batch: List[PoiData]
+    # __initial_jobs: List[TaskDefinition]
     __jobs_batch: List[TaskDefinition]
     __success_batch: List[TaskDefinition]
     __success_ids: Set[str]      # will hold until the end of session
@@ -44,7 +61,7 @@ class DatabaseWriter(mp.Process):
     finished: bool = None
     __printlock: mp.Lock
 
-    def __init__(self, db_file: str, poi_q: mp.Queue, complete_tasks_q: mp.Queue, printlock: mp.Lock):
+    def __init__(self, db_file: str, poi_q: mp.Queue, tasks_q: mp.Queue, complete_tasks_q: mp.Queue, printlock: mp.Lock):
 
         self.conn = None
         self.db_file = db_file
@@ -60,6 +77,7 @@ class DatabaseWriter(mp.Process):
         # self.cursor = self.conn.cursor()
 
         self.poi_q = poi_q
+        self.pending_tasks_q = tasks_q
         self.complete_tasks_q = complete_tasks_q
         self.__printlock = printlock
 
@@ -87,6 +105,9 @@ class DatabaseWriter(mp.Process):
             f"{self.stats.tasks} tasks completed in this session"
         )
 
+    def set_initial_jobs(self, jobs: List[TaskDefinition]):
+        self.__jobs_batch.extend(jobs)
+
     def make_db_connection(self):
 
         """ Creates a database connection to a SQLite database. Raises error when fails to connect. """
@@ -110,25 +131,29 @@ class DatabaseWriter(mp.Process):
         finally:
             self.conn = conn
 
-    def create_table(self):
-
-        """ Creates table that  """
-
-        self.cursor.execute(sql=CREATE_POI_TABLE)
-
     def __insert_rows(self, table: str,  rows: List[tuple], column_names: List[str]):
 
-        question_marks = ",".join("?" * len(rows))
+        question_marks = ",".join("?" * len(column_names))
         columns = ",".join(column_names)
-        sql = f"""INSERT INTO {table} ({columns}) VALUES ({question_marks});"""
-        self.cursor.execute(sql=sql)
+        sql = f"""INSERT INTO {table}({columns}) VALUES ({question_marks});"""
+
+        # TODO remove debug
+        if config.DEBUG:
+            with open("./test/insert.sql", "w", encoding="utf-8-sig") as f:
+                f.write(f"{sql}\n\n\nVALUES:\n\n{str(rows)}")
+            print("DEBUG writer: wrote insert expression.")
+
+        self.cursor.executemany(sql, rows)
 
         self.stats.inserts += 1
 
+        if config.DEBUG:
+            self.conn.commit()  # commit every insert when debugging
+
         if self.stats.inserts % self.__commit_each == 0:
             self.conn.commit()
-            if config.DEBUG:
-                self.print(f"{self.name}: database commit")
+            self.stats.commits += 1
+            self.print(f"{self.name}: database commit ({self.stats.commits} total)")
 
     def __write_poi_batch(self):
 
@@ -136,15 +161,16 @@ class DatabaseWriter(mp.Process):
 
             rows = [
                 (
-                    poi, "todo"  # TODO rows
+                    x.place_id, x.id, x.lon, x.lat, x.name,
+                    x.rating, x.scope, x.user_ratings_total,
+                    x.vicinity, x.types, x.price, x.business_status
                 )
-                for poi in self.__poi_batch
+                for x in self.__poi_batch
             ]
 
             self.stats.unique_pois += len(rows)     # include number of poi inn stats
 
-            column_names = []   # TODO
-            self.__insert_rows(table=config.POI_TABLE, rows=rows, column_names=column_names)
+            self.__insert_rows(table=config.POI_TABLE, rows=rows, column_names=POI_WRITEABLE_COLUMNS)
 
             self.__poi_batch = []
             if config.DEBUG:
@@ -231,13 +257,13 @@ class DatabaseWriter(mp.Process):
     def _get_poi_and_process(self):
 
         try:
-            poi: PoiData = self.poi_q.get(timeout=1)
+            poi: PoiData = self.poi_q.get(timeout=0.1)
         except Empty as e:
             time.sleep(2)   # wait for new stuff in queue (THIS queue, it is much busier)
             raise e
 
         if not isinstance(poi, PoiData):
-            self.print(f"{self.name}: received poison pill from POI channel")
+            self.print(f"{self.name}: received poison pill via POI channel")
             self.finished = True
             raise FinishException('can finish')
 
@@ -256,14 +282,34 @@ class DatabaseWriter(mp.Process):
             self.print(f"{self.name}: found completed task")
 
         if not isinstance(task, TaskDefinition):
-            self.print(f"{self.name}: received poison pill from complete tasks channel")
+            self.print(f"{self.name}: received poison pill via complete tasks channel")
             self.finished = True
             raise FinishException('can finish')
 
         if task.task_id not in self.__success_ids:
             self.__include_success_data(task=task)
             if config.DEBUG:
-                self.print(f"{self.name}: new task, including into the database")
+                self.print(f"{self.name}: new complete task, including into the database")
+
+    def _get_pending_task_and_process(self):
+
+        try:
+            task: TaskDefinition = self.pending_tasks_q.get(timeout=0.1)
+        except Empty:
+            return   # don't do anything, this queue is not that busy
+
+        if config.DEBUG:
+            self.print(f"{self.name}: found pending task")
+
+        if not isinstance(task, TaskDefinition):
+            self.print(f"{self.name}: received poison pill via pending tasks channel")
+            self.finished = True
+            raise FinishException('can finish')
+
+        # all of these will be unique
+        self.__include_success_data(task=task)
+        if config.DEBUG:
+            self.print(f"{self.name}: pending task inlcuded into the database")
 
 
     def run(self) -> None:
@@ -272,28 +318,43 @@ class DatabaseWriter(mp.Process):
 
         self.make_db_connection()
         self.cursor = self.conn.cursor()
+        self.__write_jobs_batch()
+        self.conn.commit()      # commit jobs
+        self.print(f"{self.name}: initial jobs written")
 
         while not self.finished:
 
-            # first, check for tasks
-            if not self.complete_tasks_q.empty():
+            # check for unfinished tasks
+            while not self.pending_tasks_q.empty():
+                try:
+                    self._get_pending_task_and_process()
+
+                except Empty:
+                    break
+
+                except FinishException:
+                    self.finished = True
+                    break
+
+            #  check for complete tasks
+            while not self.complete_tasks_q.empty():
                 try:
                     self._get_complete_task_and_process()
 
                 except Empty:
-                    pass
+                    break
 
                 except FinishException:
                     self.finished = True
                     break
 
             # then, check for POI - and wait of nothing found
-            if not self.poi_q.empty():
+            while not self.poi_q.empty():
                 try:
                     self._get_poi_and_process()
 
                 except Empty:
-                    pass
+                    break
 
                 except FinishException:
                     self.finished = True
