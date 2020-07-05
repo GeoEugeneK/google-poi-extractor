@@ -19,6 +19,8 @@ RESPONSE_JSON_EXTENSION = ".json"
 # must be of Polygon geometry type, only the first feature will be picked
 AOI_LAYER_URI = "D:/gis_works2/buildingsOSM.gpkg|layername=border_wgs84"        # simply put, city boundaries
 
+MAX_TRIES_WITH_TASK = 3
+MAX_REQUESTS_PER_MIN = 20
 INITIAL_RADIUS = 650
 MIN_ALLOWED_RADIUS = 6     # meters    |   avoid infinite search point recursion!
 
@@ -26,4 +28,5 @@ METRIC_CRS_EPSG = 32635     # utm 34N
 DEFAULT_ENCODING = "utf-8"
 LANGUAGE = 'ru'
 
-DEBUG = True    # will suppress some messages when disabled
+DEBUG = False    # will suppress some messages when disabled
+TB_FILE = "./tracebacks/tb.txt"
