@@ -11,6 +11,8 @@ from db.expressions import CREATE_POI_TABLE, CREATE_SUCCESS_TABLE, CREATE_JOBS_T
 from exceptions import InvalidPoiDataError, FinishException
 from tasks import TaskDefinition
 
+SUCCESS_COLUMN_NAMES = ["id", "lon", "lat", "radius", "place_type"]
+JOBS_COLUMN_NAMES = ["id", "lon", "lat", "radius", "place_type"]
 
 POI_WRITEABLE_COLUMNS = ['place_id',
                          'id',
@@ -26,7 +28,7 @@ POI_WRITEABLE_COLUMNS = ['place_id',
                          'business_status']
 
 
-class StatsClass(object):
+class WriterStatsClass(object):
 
     total_pois: int
     unique_pois: int
@@ -55,11 +57,12 @@ class DatabaseWriter(mp.Process):
     __success_ids: Set[str]      # will hold until the end of session
     __place_ids: Set[str]       # will hold until the end of session - helps avoid repeating POIs
 
+    finished: bool = None
+    __printlock: mp.Lock
+
     __write_each: int = 100     # only applies to POIs (PoiData class instances)
     __commit_each: int = 12     # make commit each N inserts
 
-    finished: bool = None
-    __printlock: mp.Lock
 
     def __init__(self, db_file: str, poi_q: mp.Queue, tasks_q: mp.Queue, complete_tasks_q: mp.Queue, printlock: mp.Lock):
 
@@ -70,7 +73,7 @@ class DatabaseWriter(mp.Process):
         self.__db_basename = os.path.basename(self.db_file)
         self.__parent_dir = os.path.dirname(os.path.abspath(self.db_file))
         assert os.path.exists(
-            self.__parent_dir), f"invalid parent directory {self.__parent_dir} for an SQLite database."
+            self.__parent_dir   ), f"invalid parent directory {self.__parent_dir} for an SQLite database."
 
         # must be initialized in a separate process for integrity
         # self.make_db_connection()
@@ -88,7 +91,7 @@ class DatabaseWriter(mp.Process):
         self.__place_ids = set()
 
         self.finished = False
-        self.stats = StatsClass()
+        self.stats = WriterStatsClass()
 
         super().__init__(daemon=True)
 
@@ -107,6 +110,13 @@ class DatabaseWriter(mp.Process):
 
     def set_initial_jobs(self, jobs: List[TaskDefinition]):
         self.__jobs_batch.extend(jobs)
+
+    def set_success_ids(self, task_ids: List[str]):
+
+        """ When resuming, set success IDs to avoid writing duplicates. """
+
+        for i in task_ids:
+            self.__success_ids.add(i)
 
     def make_db_connection(self):
 
@@ -187,12 +197,12 @@ class DatabaseWriter(mp.Process):
                 (task.task_id, task.lon, task.lat, task.radius, task.place_type) for task in self.__jobs_batch
             ]
 
-            self.stats.tasks += len(rows)  # include number of poi inn stats
+            self.stats.tasks += len(rows)  # include number of poi in stats
 
-            column_names = ["id", "lon", "lat", "radius", "place_type"]
-            self.__insert_rows(table=config.JOBS_TABLE, rows=rows, column_names=column_names)
+            # column_names = ["id", "lon", "lat", "radius", "place_type"]
+            self.__insert_rows(table=config.JOBS_TABLE, rows=rows, column_names=JOBS_COLUMN_NAMES)
 
-            self.__jobs_batch = []
+            self.__jobs_batch = []      # clean the batch
             if config.DEBUG:
                 self.print(f"{self.name}: inserted {len(rows)} rows into jobs table")
 
@@ -207,8 +217,7 @@ class DatabaseWriter(mp.Process):
                 (task.task_id, task.lon, task.lat, task.radius, task.place_type) for task in self.__success_batch
             ]
 
-            column_names = ["id", "lon", "lat", "radius", "place_type"]
-            self.__insert_rows(table=config.SUCCESS_TABLE, rows=rows, column_names=column_names)
+            self.__insert_rows(table=config.SUCCESS_TABLE, rows=rows, column_names=SUCCESS_COLUMN_NAMES)
 
             self.__success_batch = []
             if config.DEBUG:
@@ -219,16 +228,18 @@ class DatabaseWriter(mp.Process):
 
     def __include_single_poi_data(self, data: PoiData):
 
+        """ Make sure that place ID is not duplicate, before calling the function. """
+
         if not data.is_valid:
             raise InvalidPoiDataError(f"writer received invalid PoiData instance!")
 
-        self.__place_ids.add(data.place_id)
+        self.__place_ids.add(data.place_id)     # avoid writing duplicates
         self.__poi_batch.append(data)
 
         if len(self.__poi_batch) >= self.__write_each:
             self.__write_poi_batch()
 
-    def __include_success_data(self, task: TaskDefinition):
+    def __include_successful_task(self, task: TaskDefinition):
 
         self.__success_ids.add(task.task_id)
         self.__success_batch.append(task)
@@ -236,10 +247,12 @@ class DatabaseWriter(mp.Process):
         if len(self.__success_batch) >= self.__write_each:
             self.__write_success_batch()
 
-    def set_success_ids(self, task_ids: List[str]):
+    def __include_pending_task(self, task: TaskDefinition):
 
-        for i in task_ids:
-            self.__success_ids.add(i)
+        self.__jobs_batch.append(task)
+
+        if len(self.__jobs_batch) >= self.__write_each:
+            self.__write_jobs_batch()
 
     def set_place_ids(self, place_ids: List[str]):
 
@@ -259,8 +272,8 @@ class DatabaseWriter(mp.Process):
         try:
             poi: PoiData = self.poi_q.get(timeout=0.1)
         except Empty as e:
-            time.sleep(2)   # wait for new stuff in queue (THIS queue, it is much busier)
-            raise e
+            # time.sleep(0.75)   # wait for new stuff in queue (THIS queue, it is much busier)  || NOT NEEDED, wait in loop
+            raise e     # will be caught in loop in run() method
 
         if not isinstance(poi, PoiData):
             self.print(f"{self.name}: received poison pill via POI channel")
@@ -287,7 +300,7 @@ class DatabaseWriter(mp.Process):
             raise FinishException('can finish')
 
         if task.task_id not in self.__success_ids:
-            self.__include_success_data(task=task)
+            self.__include_successful_task(task=task)
             if config.DEBUG:
                 self.print(f"{self.name}: new complete task, including into the database")
 
@@ -307,7 +320,7 @@ class DatabaseWriter(mp.Process):
             raise FinishException('can finish')
 
         # all of these will be unique
-        self.__include_success_data(task=task)
+        self.__include_pending_task(task=task)
         if config.DEBUG:
             self.print(f"{self.name}: pending task inlcuded into the database")
 
@@ -316,15 +329,19 @@ class DatabaseWriter(mp.Process):
 
         """ Main loop in thread. """
 
+        # initialize connection in a separate thread
         self.make_db_connection()
         self.cursor = self.conn.cursor()
         self.__write_jobs_batch()
-        self.conn.commit()      # commit jobs
+        self.conn.commit()      # commit initial jobs
         self.print(f"{self.name}: initial jobs written")
 
         while not self.finished:
 
-            # check for unfinished tasks
+            """     NOTE: the following order of calls guarantees 
+                    that all POIs will be recorded before acknowledging task success.       """
+
+            # check for scheduled tasks. if there are any, process them until there are none and move on
             while not self.pending_tasks_q.empty():
                 try:
                     self._get_pending_task_and_process()
@@ -336,19 +353,9 @@ class DatabaseWriter(mp.Process):
                     self.finished = True
                     break
 
-            #  check for complete tasks
-            while not self.complete_tasks_q.empty():
-                try:
-                    self._get_complete_task_and_process()
-
-                except Empty:
-                    break
-
-                except FinishException:
-                    self.finished = True
-                    break
-
-            # then, check for POI - and wait of nothing found
+            # then, check for POIs - and wait if nothing found.
+            # do not write successful tasks before writing collected POIs!
+            # this
             while not self.poi_q.empty():
                 try:
                     self._get_poi_and_process()
@@ -360,9 +367,23 @@ class DatabaseWriter(mp.Process):
                     self.finished = True
                     break
             else:
-                time.sleep(2)   # wait for the queue to fill
+                time.sleep(1.0)   # wait for the queue to fill
 
-        # make sure everything is recorded
+            #  check for complete tasks. will only appear after any POIs have been collected
+            while not self.complete_tasks_q.empty():
+                try:
+                    self._get_complete_task_and_process()
+
+                except Empty:
+                    break
+
+                except FinishException:
+                    self.finished = True
+                    break
+
+        self.print(f"{self.name} ready to finish...")
+
+        # make sure everything is recorded when quitting
         if self.__poi_batch:
             self.__write_poi_batch()
 
