@@ -60,7 +60,7 @@ class DatabaseWriter(mp.Process):
     finished: bool = None
     __printlock: mp.Lock
 
-    __write_each: int = 100     # only applies to POIs (PoiData class instances)
+    __write_each: int = 1     # only applies to POIs (PoiData class instances). using 1 will insert each row separately
     __commit_each: int = 12     # make commit each N inserts
 
 
@@ -155,12 +155,13 @@ class DatabaseWriter(mp.Process):
 
         self.cursor.executemany(sql, rows)
 
-        self.stats.inserts += 1
+        self.stats.inserts += 1     # keep track of inserts here, regardless of target table
 
         if config.DEBUG:
             self.conn.commit()  # commit every insert when debugging
 
-        if self.stats.inserts % self.__commit_each == 0:
+        # number of inserts is non-zero at this point in any case
+        elif self.stats.inserts % self.__commit_each == 0:
             self.conn.commit()
             self.stats.commits += 1
             self.print(f"{self.name}: database commit ({self.stats.commits} total)")
@@ -336,6 +337,8 @@ class DatabaseWriter(mp.Process):
         self.conn.commit()      # commit initial jobs
         self.print(f"{self.name}: initial jobs written")
 
+        last_task = time.time()
+
         while not self.finished:
 
             """     NOTE: the following order of calls guarantees 
@@ -345,6 +348,7 @@ class DatabaseWriter(mp.Process):
             while not self.pending_tasks_q.empty():
                 try:
                     self._get_pending_task_and_process()
+                    last_task = time.time()
 
                 except Empty:
                     break
@@ -359,6 +363,7 @@ class DatabaseWriter(mp.Process):
             while not self.poi_q.empty():
                 try:
                     self._get_poi_and_process()
+                    last_task = time.time()
 
                 except Empty:
                     break
@@ -373,6 +378,7 @@ class DatabaseWriter(mp.Process):
             while not self.complete_tasks_q.empty():
                 try:
                     self._get_complete_task_and_process()
+                    last_task = time.time()
 
                 except Empty:
                     break
@@ -380,6 +386,11 @@ class DatabaseWriter(mp.Process):
                 except FinishException:
                     self.finished = True
                     break
+
+            # exit if waiting for new task for too long
+            waiting_uninterrupted = time.time() - last_task
+            if waiting_uninterrupted >= config.MAX_WAITING_UNINTERRUPTED:
+                break
 
         self.print(f"{self.name} ready to finish...")
 

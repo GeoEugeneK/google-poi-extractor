@@ -2,6 +2,7 @@ import json
 import multiprocessing as mp
 import os
 # import threading
+import time
 from queue import Empty
 
 import config
@@ -47,11 +48,14 @@ class RawResponseWriter(mp.Process):
 
         self.print(f"{self.name}: writer started")
 
+        last_task = time.time()
         done = False
+
         while not done:
 
             try:
                 task = self.poi_q.get(timeout=5)   # don't wait forever
+                last_task = time.time()
             except Empty:
                 continue
 
@@ -66,4 +70,10 @@ class RawResponseWriter(mp.Process):
             if self.count % self.__info_each_n == 0:
                 self.print(f"{self.name}: data for {self.count} POIs were written as JSONs.")
 
+            # exit if waiting for new task for too long
+            waiting_uninterrupted = time.time() - last_task
+            if waiting_uninterrupted >= config.MAX_WAITING_UNINTERRUPTED:
+                break
+
         self.print(f"{self.name}: writer done. Total {self.count} files written to disk in this session. Exiting...")
+        # join thread in main

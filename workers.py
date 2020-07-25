@@ -52,7 +52,7 @@ class GoogleWorker(mp.Process):
     """ One API key per collector worker. """
 
     key: str
-    job_done: bool = None
+    finished: bool = None
     tasks_q: mp.Queue
     poi_db_q: mp.Queue
     critical_errors_threshold: int = 10
@@ -83,7 +83,7 @@ class GoogleWorker(mp.Process):
         self.__writelock = writelock
         self.__printlock = printlock
 
-        self.job_done = False
+        self.finished = False
         self.densifier: Densifier = None   # initialize in a separate thread
 
         self.stats = StatsClass()
@@ -207,7 +207,7 @@ class GoogleWorker(mp.Process):
 
         except (googlemaps.exceptions._OverQueryLimit, WastedQuotaException) as e:
             self.write_traceback(e)
-            self.job_done = True
+            self.finished = True
             raise WastedQuotaException(
                 f'{self.name} reached maximum allowed quota. For details, check your Google Developers Account\n'
                 f'{self.stats.previous_requests} requests made overall\n'
@@ -285,20 +285,20 @@ class GoogleWorker(mp.Process):
                 self.tasks_q.put(t)     # for processing
                 self.tasks_database_q.put(t)    # for record in the database
         except SearchRecursionError:
-            pass    # just skip these if no recursion possible
+            pass    # skip if no recursion is possible due to radius being too small (can be changed in config)
 
     def _get_from_queue_and_do_job(self):
 
         try:
             #   will wait for N sec and throw Empty exception if nothing found
-            task: TaskDefinition = self.tasks_q.get(timeout=5)  # is an instance of PoiSearchTask
+            task: TaskDefinition = self.tasks_q.get(timeout=1)  # is an instance of TaskDefinition
         except Empty as e:
-            time.sleep(1)   # wait a bit for new tasks
+            time.sleep(1)   # wait for new tasks a bit
             raise e         # will repeat the main loop
 
         if not isinstance(task, TaskDefinition):
             self.print(f"{self.name}: received poison pill")
-            self.job_done = True
+            self.finished = True
             raise FinishException('can finish')
 
         elif task.tries >= config.MAX_TRIES_WITH_TASK:
@@ -316,8 +316,9 @@ class GoogleWorker(mp.Process):
 
         self.print(f"{self.name} started")
         self._prepare()
+        last_task = time.time()   # time waiting for a new task, will exit if waiting for too long
 
-        while not self.job_done:
+        while not self.finished:
 
             if self.stats.critical_errors > self.critical_errors_threshold:
                 raise Exception(
@@ -331,6 +332,7 @@ class GoogleWorker(mp.Process):
                 self.stats.avg_task_time = (_elapsed + self.stats.tasks * self.stats.avg_task_time) / (self.stats.tasks + 1)
                 self.stats.tasks += 1
 
+                last_task = time.time()
 
                 if self.stats.tasks % self.__info_each == 0:
                     self.print_info()
@@ -339,12 +341,18 @@ class GoogleWorker(mp.Process):
                 continue
 
             except FinishException:
-                self.job_done = True
+                self.finished = True
                 break
 
             if self.stats.requests % 4 == 0:    # update tracker every N
                 self._update_tracker()
 
-        # after the loop
+            # exit if waiting for new task for too long
+            waiting_uninterrupted = time.time() - last_task
+            if waiting_uninterrupted >= config.MAX_WAITING_UNINTERRUPTED:
+                break
+
+        # after the loop and before thread can be joined
         self._update_tracker()
 
+        # join thread in main

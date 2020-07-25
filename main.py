@@ -23,6 +23,7 @@ def prepare_database(cursor: sqlite3.Cursor):
 
     """ Drop and make new tables """
 
+    # drop previous (IF EXISTS statements)
     cursor.execute(expressions.DROP_SUCCESS)
     cursor.execute(expressions.DROP_JOBS)
 
@@ -39,7 +40,7 @@ def make_initial_tasks() -> List[TaskDefinition]:
     assert config.AOI_LAYER_URI and isinstance(config.AOI_LAYER_URI, str), \
         f'invalid layer URI {config.AOI_LAYER_URI}, see config to fix'
 
-    # derive spacing
+    # calculate spacing
     spacing = config.INITIAL_RADIUS * 2 / (2 ** 0.5)
 
     aoi_polygon = get_aoi_polygon(config.AOI_LAYER_URI)
@@ -98,7 +99,7 @@ def restore_tasks_and_places(cursor: sqlite3.Cursor):
 
     else:
         unfinished_tasks = resume.restore_unfinished_tasks(cursor=cursor)
-        collected_place_ids = resume.restore_collected_place_ids()
+        collected_place_ids = resume.restore_collected_place_ids(cursor=cursor)
 
     return unfinished_tasks, collected_place_ids
 
@@ -133,9 +134,10 @@ def main():
     collected_place_ids: List[str]
 
     if config.RESUME:
+        # pick up where stopped last time
         tasks, collected_place_ids = restore_tasks_and_places(cursor=cursor)    # unfinished tasks only
         db_writer.set_place_ids(place_ids=collected_place_ids)      # avoid writing duplicates, will check against these
-        db_writer.set_success_ids(["dummy"])
+        db_writer.set_success_ids(["dummy", ])
 
     else:
         tables = resume.get_existing_tables(cursor=cursor)
@@ -152,6 +154,7 @@ def main():
     # also include in all jobs table
     db_writer.set_initial_jobs(jobs=tasks)
 
+    conn.commit()
     conn.close()    # close connection in this thread
 
     # get keys
@@ -168,7 +171,7 @@ def main():
         t = GoogleWorker(api_key=k, tasks_q=tasks_q, tasks_for_record_q=tasks_for_record_q, database_q=database_q,
                          complete_tasks_q=complete_q, rawfile_q=raw_json_q, printlock=printlock, writelock=writelock)
         t.start()
-        time.sleep(1)   # wait between starts
+        time.sleep(1)       # wait between starts
         collectors.append(t)
 
     with printlock:

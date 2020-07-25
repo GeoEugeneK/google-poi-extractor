@@ -28,5 +28,7 @@ METRIC_CRS_EPSG = 32635     # utm 34N
 DEFAULT_ENCODING = "utf-8"
 LANGUAGE = 'ru'
 
+MAX_WAITING_UNINTERRUPTED = 60  # seconds   |   max time a thread can wait for new tasks, will exit when reached
+
 DEBUG = False    # will suppress some messages when disabled
 TB_FILE = "./tracebacks/tb.txt"
