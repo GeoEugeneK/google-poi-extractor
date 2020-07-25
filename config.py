@@ -12,7 +12,6 @@ SUCCESS_TABLE = "success"
 COMMIT_EACH = 12    # will commit each N new inserts (single insert batch size can be adjusted in db.writer)
 
 RESUME = False      # if True, will pick up where it stopped in the last session
-TASKS_FILE = f""    # additional parameter needed to resume correctly. Ignored when "RESUME" is set to False
 
 RAW_DATA_FOLDER = "./data/"     # raw response JSONs
 RESPONSE_JSON_EXTENSION = ".json"
