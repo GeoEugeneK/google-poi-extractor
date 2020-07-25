@@ -61,7 +61,7 @@ class DatabaseWriter(mp.Process):
     __printlock: mp.Lock
 
     __write_each: int = 1     # only applies to POIs (PoiData class instances). using 1 will insert each row separately
-    __commit_each: int = 12     # make commit each N inserts
+    __commit_each: int = config.COMMIT_EACH     # make commit each N inserts
 
 
     def __init__(self, db_file: str, poi_q: mp.Queue, tasks_q: mp.Queue, complete_tasks_q: mp.Queue, printlock: mp.Lock):

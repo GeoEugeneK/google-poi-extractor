@@ -9,6 +9,7 @@ VALID_TYPES_FILE = "valid_types.txt"
 POI_TABLE = "poi"      # valid sqlite table name, will be placed in public schema by default
 JOBS_TABLE = "jobs"
 SUCCESS_TABLE = "success"
+COMMIT_EACH = 12    # will commit each N new inserts (single insert batch size can be adjusted in db.writer)
 
 RESUME = False      # if True, will pick up where it stopped in the last session
 TASKS_FILE = f""    # additional parameter needed to resume correctly. Ignored when "RESUME" is set to False
